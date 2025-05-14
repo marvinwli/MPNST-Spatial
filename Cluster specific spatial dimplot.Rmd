@@ -1,0 +1,102 @@
+---
+title: "SpatialDimPlot for specific clusters in a seurat object"
+output: html_document
+date: "2024-11-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.height = 5, fig.width = 7)
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+```
+
+Load packages, libraries, and spatial data
+```{r, include=FALSE}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(pheatmap)
+```
+
+```{r}
+# Extract cluster colors from SpatialDimPlot
+extract_cluster_colors <- function(seurat_object, clustering_type = "seurat_clusters") {
+  # Set the identity class based on the specified clustering type
+  Idents(seurat_object) <- seurat_object[[clustering_type]][, 1]
+  
+  # Generate the SpatialDimPlot
+  plot <- SpatialDimPlot(seurat_object, label = TRUE, label.size = 3, pt.size.factor = 4)
+  plot_data <- ggplot_build(plot)$data[[1]]
+  
+  # Extract Seurat cluster levels
+  cluster_ids <- levels(Idents(seurat_object))
+  
+  # Create a mapping of ggplot group IDs to Seurat cluster IDs
+  group_to_cluster <- setNames(cluster_ids, seq_along(cluster_ids))
+  
+  # Create a mapping of clusters to their colors
+  cluster_color_mapping <- data.frame(
+    Cluster = group_to_cluster[as.character(plot_data$group)],  # Map ggplot group IDs to cluster IDs
+    Color = plot_data$fill                                      # Extract corresponding colors
+  ) %>%
+    distinct()
+  
+  # Return a named vector of colors for all clusters
+  setNames(cluster_color_mapping$Color, cluster_color_mapping$Cluster)
+}
+
+# Function to create a SpatialDimPlot for any number of clusters
+create_highlight_plot <- function(seurat_object, highlight_clusters, clustering_type = "seurat_clusters") {
+  # Set the identity class based on the specified clustering type
+  Idents(seurat_object) <- seurat_object[[clustering_type]][, 1]
+  
+  # Extract colors for all clusters
+  all_cluster_colors <- extract_cluster_colors(seurat_object, clustering_type)
+  
+  # Map each highlight cluster explicitly to its correct color
+  highlight_colors <- all_cluster_colors[as.character(highlight_clusters)]
+  
+  # Ensure that the colors are matched correctly to the cluster IDs
+  names(highlight_colors) <- as.character(highlight_clusters)
+  
+  # Define cells to highlight for each cluster
+  cells_to_highlight <- setNames(
+    lapply(highlight_clusters, function(cl) WhichCells(seurat_object, idents = cl)),
+    as.character(highlight_clusters)
+  )
+  
+  # Explicitly map colors to cluster IDs
+  final_highlight_colors <- c(highlight_colors, "grey")
+  
+  # Create the SpatialDimPlot
+  SpatialDimPlot(
+    object = seurat_object,
+    cells.highlight = cells_to_highlight,
+    cols.highlight = final_highlight_colors,
+    pt.size.factor = 4.5,
+    label = F,
+    label.size = 3
+  ) + NoLegend()
+}
+
+```
+
+```{r}
+# Load seurat object
+seuratobject <- mpnst_14143
+Idents(seuratobject) <- seuratobject$Morphology
+p1 <- DimPlot(seuratobject, reduction = "umap", label = F)
+p4 <- SpatialDimPlot(seuratobject, label = F, label.size = 3, pt.size.factor = 4.5) + NoLegend()
+
+Idents(seuratobject) <- seuratobject$seurat_clusters
+p2 <- SpatialDimPlot(seuratobject, label = TRUE, label.size = 3, pt.size.factor = 4.5) + NoLegend()
+p3 <- DimPlot(object = seuratobject, reduction = "umap", label = T, label.box = T) + NoLegend()
+
+# Define clusters to highlight
+highlight_clusters <- c(11)  # Specify clusters to highlight
+
+# Generate the plot
+create_highlight_plot(seuratobject, highlight_clusters, clustering_type = "seurat_clusters")
+
+p2
+```

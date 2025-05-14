@@ -1,0 +1,29 @@
+---
+title: "Pseudotime analysis"
+output: pdf_document
+date: "2025-02-06"
+---
+
+```{r}
+install.packages("remotes")
+remotes::install_github("mojaveazure/seurat-disk")  # For converting Seurat <-> AnnData
+
+library(Seurat)
+library(SeuratDisk)
+library(Matrix)
+
+mpnst_14143 <- readRDS("/Users/marvinli/MPNST rds Objects/mpnst_14143.rds")
+counts <- GetAssayData(mpnst_14143, assay = "Spatial", layer = "counts")
+
+writeMM(counts, file = "/Users/marvinli/Downloads/mpnst14143counts.mtx")
+write.csv(rownames(counts), file = "/Users/marvinli/Downloads/mpnst14143genes.csv", quote = FALSE)
+write.csv(colnames(counts), file = "/Users/marvinli/Downloads/mpnst14143cells.csv", quote = FALSE)
+
+metadata <- mpnst_14143@meta.data
+write.csv(metadata, file = "/Users/marvinli/Downloads/mpnst14143spotmetadata.csv")
+
+coords <- mpnst_14143@images$slice1$centroids@coords
+write.csv(coords, file = "/Users/marvinli/Downloads/mpnst14143coords.csv")
+
+
+```

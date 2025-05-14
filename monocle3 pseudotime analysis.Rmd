@@ -1,0 +1,256 @@
+---
+title: "monocle3 analysis"
+output: pdf_document
+date: "2025-02-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+if (!requireNamespace("BiocManager", quietly=TRUE)){
+    install.packages("BiocManager")
+}
+install.packages("devtools")
+devtools::install_github('cole-trapnell-lab/monocle3')
+
+# Load libraries
+library(monocle3)
+library(Seurat)      # Optional if you start from a Seurat object
+library(tidyverse)   # For convenient data manipulation
+library(dplyr)
+library(FNN)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+```{r}
+seurat_obj <- readRDS("/Users/marvinli/MPNST rds Objects/mpnst_46374.rds")
+
+# Method A: Using Seurat's GetAssayData()
+counts_mat <- GetAssayData(
+  object = seurat_obj, 
+  assay  = "Spatial", 
+  slot   = "counts"
+)
+
+# Create a gene annotation data frame
+gene_annotation <- data.frame(
+  gene_short_name = rownames(counts_mat),
+  row.names       = rownames(counts_mat)
+)
+
+# Cell metadata from Seurat object
+cell_metadata <- seurat_obj@meta.data
+
+cds <- new_cell_data_set(
+  expression_data = counts_mat,
+  cell_metadata   = cell_metadata,
+  gene_metadata   = gene_annotation
+)
+
+# Preprocessing
+cds <- preprocess_cds(cds, num_dim = 15)
+
+# Dimensionality reduction (e.g., UMAP)
+cds <- reduce_dimension(cds, reduction_method = "UMAP")
+
+# Cluster cells (spots)
+cds <- cluster_cells(cds, reduction_method = "UMAP", )
+
+table(partitions(cds))
+plot_cells(cds, color_cells_by = "Morphology")
+plot_cells(cds, color_cells_by = "partition")
+```
+
+```{r}
+# Define the partitions to keep (e.g., partitions 1 and 2)
+selected_partitions <- c(1,2)
+
+# Get the barcodes (spot IDs) of cells in selected partitions
+keep_cells <- colnames(cds)[partitions(cds) %in% selected_partitions]
+
+# Subset the `cds` object
+cds_subset <- cds[, keep_cells]
+
+# Re-run dimensionality reduction (UMAP)
+cds_subset <- preprocess_cds(cds_subset, num_dim = 15)
+cds_subset <- reduce_dimension(cds_subset, reduction_method = "UMAP")
+
+# Re-cluster the subset (to reset Monocle's partition information)
+cds_subset <- cluster_cells(cds_subset, reduction_method = "UMAP")
+
+# Re-run graph learning with the subsetted data
+cds_subset <- learn_graph(cds_subset, use_partition = FALSE)  # Prevent automatic partitioning
+
+schwann_gene_list <- c("PLP1", "MPZ", "SOX10", "MBP")
+mes_nc_gene_list <- c("IGFBP2", "ZEB1")
+plot_cells(cds_subset, genes = schwann_gene_list, cell_size = 0.7)
+plot_cells(cds_subset, genes = mes_nc_gene_list, cell_size = 0.7)
+plot_cells(cds_subset, color_cells_by = "Morphology", cell_size = 0.5,
+                            group_label_size = 7)
+```
+
+```{r}
+# Order cells in pseudotime: pick a "root" spot (cell)
+# Suppose you visually identified a root near (UMAP1 = 5, UMAP2 = 3)
+chosen_x <- -4
+chosen_y <- 4
+
+# Convert coordinates to a matrix and search for the nearest cell using kNN
+umap_coords_subset <- reducedDims(cds_subset)$UMAP
+
+closest_cell_index <- get.knnx(umap_coords_subset, matrix(c(chosen_x, chosen_y), ncol = 2), k = 1)$nn.index
+
+# Extract the actual cell name
+closest_cell_subset <- rownames(umap_coords_subset)[closest_cell_index]
+print(closest_cell_subset)
+
+# Verify the corrected coordinates
+print(umap_coords_subset[closest_cell_subset, ])
+
+# Order cells in pseudotime using the identified root cell
+cds_subset <- order_cells(cds_subset, root_cells = closest_cell_subset)
+
+# Extract pseudotime values
+pseudotime_vals_subset <- pseudotime(cds_subset)
+
+# Ensure spot IDs match
+valid_spots_subset <- names(pseudotime_vals_subset)[is.finite(pseudotime_vals_subset)]
+
+# Assign pseudotime values only to the selected spots in the Seurat object
+seurat_obj$Monocle_pseudotime <- NA
+seurat_obj$Monocle_pseudotime[valid_spots_subset] <- pseudotime_vals_subset[valid_spots_subset]
+seurat_obj[["Monocle_pseudotime"]] <- as.numeric(seurat_obj$Monocle_pseudotime)
+
+# Determine the range of pseudotime values
+range_pseudotime <- range(seurat_obj$Monocle_pseudotime, na.rm = TRUE)
+print(range_pseudotime)
+
+#pt_sizes <- setNames(c(8, 6, 6, 5, 4.5, 6), c("11502", "25729", "30175", "26364", "14143", "46374"))
+# Plot the spatial pseudotime without the 'cols' argument
+p <- SpatialFeaturePlot(
+  seurat_obj,
+  features = "Monocle_pseudotime",
+  pt.size.factor = 6.5,
+  min.cutoff = range_pseudotime[1],
+  max.cutoff = range_pseudotime[2]
+) + scale_fill_viridis_c(option = "plasma", limits = range_pseudotime)
+
+# Add the magma viridis color scale for fill
+p 
+
+# Plot Monocle3 plots (the ones not involving pseudotime remain unchanged)
+partitionplot <- plot_cells(cds_subset, color_cells_by = "partition", cell_size = 0.5,
+                            trajectory_graph_segment_size = 1, label_groups_by_cluster = TRUE,
+                            group_label_size = 7, reduction_method = "UMAP")
+clusterplot <- plot_cells(cds_subset, color_cells_by = "cluster", cell_size = 0.5,
+                          trajectory_graph_segment_size = 1, label_groups_by_cluster = TRUE,
+                          group_label_size = 7, reduction_method = "UMAP")
+morphologyplot <- plot_cells(cds_subset, color_cells_by = "Morphology", cell_size = 0.5,
+                             trajectory_graph_segment_size = 1, group_label_size = 7)
+
+pseudotimeplot <- plot_cells(cds_subset, color_cells_by = "pseudotime", cell_size = 0.5,
+                             trajectory_graph_segment_size = 1, group_label_size = 7,
+                             reduction_method = "UMAP") +
+  scale_color_viridis_c(option = "plasma", limits = range_pseudotime)
+
+
+# Display the plots
+partitionplot
+clusterplot
+morphologyplot
+pseudotimeplot
+
+```
+
+```{r}
+# Perform graph_test to identify pseudotime-associated genes
+gene_pseudotime_test <- graph_test(cds_subset, neighbor_graph = "principal_graph", cores = 14)
+
+# Select genes significantly varying with pseudotime
+sig_genes <- gene_pseudotime_test %>% 
+  filter(q_value < 0.05) %>% 
+  arrange(q_value) %>% 
+  pull(gene_short_name)
+
+top_sig_genes <- head(sig_genes, 60)
+
+# Plot pseudotime expression heatmap using Monocle3's function
+
+
+```
+
+```{r fig.height=12}
+library(mgcv)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+# 1️⃣ Prepare data
+ord_cells <- order(pseudotime(cds_subset), na.last = NA)
+pt_vals   <- pseudotime(cds_subset)[ord_cells]
+
+expr_mat <- exprs(cds_subset)[top_sig_genes, ord_cells]
+
+# 2️⃣ Fit GAM & predict on a uniform pseudotime grid
+pt_grid <- seq(min(pt_vals), max(pt_vals), length.out = 200)
+
+smoothed <- t(sapply(rownames(expr_mat), function(g) {
+  df <- data.frame(expr = as.numeric(expr_mat[g, ]), pt = pt_vals)
+  gam_fit <- mgcv::gam(expr ~ s(pt, bs = "cs"), data = df)
+  predict(gam_fit, newdata = data.frame(pt = pt_grid))
+}))
+rownames(smoothed) <- rownames(expr_mat)
+colnames(smoothed) <- round(pt_grid, 3)
+
+# 3️⃣ Scale rows
+smoothed_scaled <- t(scale(t(smoothed)))
+
+library(circlize)
+library(viridis)
+
+# Re‑use the same range you computed for SpatialFeaturePlot
+pt_min <- range_pseudotime[1]
+pt_max <- range_pseudotime[2]
+
+# Build a matching color function
+pt_col_fun <- colorRamp2(
+  breaks = seq(pt_min, pt_max, length.out = 256),
+  colors = viridis::plasma(256)
+)
+
+# --- Re‑order rows by expression at earliest pseudotime ---
+# (first column of your smoothed & scaled matrix)
+row_order <- order(smoothed_scaled[,1], decreasing = TRUE)
+smoothed_sorted <- smoothed_scaled[row_order, ]
+
+# 1) Build annotation WITHOUT a legend
+col_anno <- HeatmapAnnotation(
+  Pseudotime = pt_grid,
+  col       = list(Pseudotime = pt_col_fun),
+  annotation_height = unit(4, "mm"),
+  show_legend = FALSE    # <<< disables the annotation legend
+)
+
+# 2) Build heatmap WITHOUT its legend
+ht <- Heatmap(
+  smoothed_sorted,
+  name               = "Scaled Expression",
+  cluster_rows       = FALSE,
+  cluster_columns    = FALSE,
+  show_column_names  = FALSE,
+  top_annotation     = col_anno,
+  use_raster         = FALSE,
+  row_names_gp       = gpar(fontsize = 14),
+  show_heatmap_legend = FALSE  # <<< disables the heatmap legend
+)
+
+grid::grid.newpage()
+draw(ht)
+p
+```
+
+

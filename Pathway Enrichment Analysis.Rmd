@@ -1,0 +1,538 @@
+---
+title: "Pathway enrichment heatmap"
+output: pdf_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(fgsea)
+install.packages("msigdbr")
+library(msigdbr) # For hallmark gene sets
+library(reshape2)
+library(pheatmap)
+library(dplyr)
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+library(cowplot)
+library(scales)
+library(tidyr)
+BiocManager::install("ComplexHeatmap")
+install.packages("circlize")
+library(ComplexHeatmap)
+library(circlize)
+library(ggplot2)
+if (!requireNamespace("tibble", quietly = TRUE)) {
+  install.packages("tibble")
+}
+library(tibble)
+library(data.table)
+install.packages("UpSetR")
+library(UpSetR)
+```
+
+Loads seurat object, performs DGEx at cluster level and creates ranked gene lists (for each cluster)
+```{r}
+seurat_object <- readRDS("/Users/marvinli/MPNST rds Objects/mpnst_25729.rds")
+clusters <- unique(seurat_object$seurat_clusters)
+# Use lapply to perform DE analysis and compute gene rankings for each cluster
+gene_ranks <- lapply(clusters, function(cluster) {
+  # Perform DE analysis for the current cluster vs all others
+  markers <- FindMarkers(seurat_object, ident.1 = cluster, ident.2 = NULL, logfc.threshold = 0)
+  
+  # Replace zero p-values with a small value
+  markers$p_val[markers$p_val == 0] <- 1e-322
+  markers$p_val_adj[markers$p_val_adj == 0] <- 1e-322
+  
+  # Compute ranking metric: -log10(p_val) * sign(avg_log2FC)
+  markers$rank <- -log10(markers$p_val) * sign(markers$avg_log2FC)
+  
+  # Sort genes by the ranking metric
+  ranked_genes <- markers$rank
+  names(ranked_genes) <- rownames(markers)
+  ranked_genes <- ranked_genes[order(ranked_genes, decreasing = TRUE)]
+  return(ranked_genes)
+  }
+)
+names(gene_ranks) <- clusters
+
+```
+
+Perform fgsea, convert results into a matrix of NES scores and extract MPNST percentage of each cluster
+```{r}
+# Load MSigDB hallmark pathways for Homo sapiens
+#msigdb_data <- msigdbr(species = "Homo sapiens", category = "H")
+#pathways <- split(msigdb_data$gene_symbol, msigdb_data$gs_name)
+
+msigdb_data <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG")
+pathways <- split(msigdb_data$gene_symbol, msigdb_data$gs_name)
+
+
+# Run fgsea for all clusters
+fgsea_results <- lapply(names(gene_ranks), function(cluster) {
+  fgsea(
+    pathways = pathways,
+    stats = gene_ranks[[cluster]],
+    nPermSimple = 50000
+  )
+})
+
+# Convert fgsea_results into a named list
+names(fgsea_results) <- names(gene_ranks)
+
+# Convert fgsea results into a matrix of NES scores
+nes_matrix <- do.call(cbind, lapply(fgsea_results, function(result) {
+  result %>% 
+    as.data.frame() %>%
+    select(pathway, NES) %>%
+    arrange(pathway) %>%
+    pull(NES)  # Extract NES column as a vector
+}))
+
+# Add pathway names as row names and cluster names as column names
+row.names(nes_matrix) <- fgsea_results[[1]]$pathway
+colnames(nes_matrix) <- names(fgsea_results)
+
+
+# Create MPNST gradient annotation
+morphology_percentage <- seurat_object@meta.data %>%
+  count(seurat_clusters, Morphology) %>%  # Count occurrences of each morphology in each cluster
+  pivot_wider(names_from = Morphology, values_from = n, values_fill = 0) %>%  # Convert to wide format
+  mutate(
+    Total = rowSums(across(-seurat_clusters)),  # Compute total spot count per cluster
+    across(-c(seurat_clusters, Total), ~ .x / Total * 100, .names = "{.col}_percentage")  # Compute % for each morphology
+  )
+
+# Extract MPNST percentage as a named vector
+mpnst_percent_vector <- morphology_percentage$MPNST_percentage
+names(mpnst_percent_vector) <- morphology_percentage$seurat_clusters
+```
+
+
+Cluster pathway enrichment heatmap
+```{r heatmap, fig.height=18, fig.width=12}
+# Prepare color gradient for NES values
+nes_colors <- colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+
+# Reorder MPNST percentage vector to match nes_matrix column order
+mpnst_percent_vector <- mpnst_percent_vector[colnames(nes_matrix)]
+
+# Orders the columns of nes_matrix based on mpnst percentage
+#ordered_columns <- names(sort(mpnst_percent_vector))  # Sort by MPNST percentage
+#nes_matrix <- nes_matrix[, ordered_columns]  # Reorder columns of nes_matrix
+#mpnst_percent_vector <- mpnst_percent_vector[ordered_columns]
+
+# Define the color gradient for MPNST percentage
+mpnst_percentage_colors <- colorRamp2(c(0, 50, 100), c("white", "lightgreen", "darkgreen"))
+
+top_annotation <- HeatmapAnnotation(
+  MPNST = anno_simple(
+    mpnst_percent_vector,
+    col = mpnst_percentage_colors,
+    gp = gpar(col = "grey"),
+    border = TRUE
+  ),
+  annotation_name_side = NULL,  # This prevents any annotation name from being shown
+  show_annotation_name = FALSE
+)
+
+# Create a top annotation without legend parameters
+# Create a custom legend for MPNST percentage with smaller size
+mpnst_legend <- Legend(
+  title = "MPNST Percentage",
+  col_fun = mpnst_percentage_colors,
+  at = c(0, 50, 100),
+  labels = c("0%", "50%", "100%"),
+  direction = "horizontal",
+  title_gp = gpar(fontsize = 8),  # Smaller title font
+  labels_gp = gpar(fontsize = 6), # Smaller label font
+  grid_height = unit(6, "mm"),   # Adjust grid height
+  grid_width = unit(6, "mm")     # Adjust grid width
+)
+
+# Create a custom legend for NES values with smaller size
+nes_legend <- Legend(
+  title = "NES",
+  col_fun = nes_colors,
+  at = c(-2, -1, 0, 1, 2),
+  labels = c("-2", "-1", "0", "1", "2"),
+  direction = "horizontal",
+  title_gp = gpar(fontsize = 8),  # Smaller title font
+  labels_gp = gpar(fontsize = 6), # Smaller label font
+  grid_height = unit(6, "mm"),   # Adjust grid height
+  grid_width = unit(6, "mm")     # Adjust grid width
+)
+
+# Draw the heatmap with the annotation and smaller legends
+draw(
+  Heatmap(
+    nes_matrix,
+    name = "NES",
+    col = nes_colors,
+    top_annotation = top_annotation,
+    cluster_rows = TRUE,
+    cluster_columns = T, #CHANGE THIS TO TRUE TO SEE HCLUST RESULTS
+    show_row_names = TRUE,
+    show_column_names = TRUE,
+    rect_gp = gpar(col = "grey"),
+    row_names_gp = gpar(fontsize = 8),
+    column_names_gp = gpar(fontsize = 8),
+    show_heatmap_legend = F
+  ),
+  annotation_legend_list = list(mpnst_legend, nes_legend), # Add both legends
+  annotation_legend_side = "bottom",                      # Position legends at the bottom
+  heatmap_legend_side = "bottom",                         # Position heatmap legend at the bottom
+  merge_legends = TRUE                                    # Merge legends for alignment
+)
+```
+
+Map normalized enrichment scores back onto spatial plot
+```{r fig.height=8, fig.width=24}
+# Define pathways of interest
+#pathways_of_interest <- c("HALLMARK_ANGIOGENESIS", "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION", "HALLMARK_HYPOXIA", "HALLMARK_TGF_BETA_SIGNALING")
+pathways_of_interest <- c("KEGG_NEUROACTIVE_LIGAND_RECEPTOR_INTERACTION", "KEGG_RETINOL_METABOLISM", "KEGG_STEROID_BIOSYNTHESIS", "KEGG_OXIDATIVE_PHOSPHORYLATION")
+
+# Find global min and max NES values across selected pathways
+global_min <- min(nes_matrix[pathways_of_interest, ], na.rm = TRUE)
+global_max <- max(nes_matrix[pathways_of_interest, ], na.rm = TRUE)
+
+# Loop through pathways, extract NES values, and create SpatialFeaturePlots with consistent legend
+plots <- lapply(pathways_of_interest, function(pathway) {
+  # Extract NES values for the pathway
+  nes_values <- nes_matrix[pathway, , drop = FALSE]
+  
+  # Create a named vector mapping clusters to NES values
+  cluster_nes <- setNames(as.numeric(nes_values), colnames(nes_values))
+  
+  # Map NES values to individual spots based on their cluster
+  seurat_object@meta.data[[pathway]] <- cluster_nes[as.character(seurat_object$seurat_clusters)]
+  
+  # Generate spatial plot with consistent color scale
+  SpatialFeaturePlot(seurat_object, features = pathway, pt.size.factor = 6) +
+    scale_fill_gradient2(
+      low = "blue", mid = "white", high = "red", midpoint = 0, 
+      limits = c(global_min, global_max)  # Set consistent scale
+    ) +
+    ggtitle(pathway) +
+    theme(legend.title = element_text(size = 0), legend.text = element_text(size = 8), plot.title = element_text(size = 15, hjust = 0.5))
+})
+
+# Display all plots together
+cowplot::plot_grid(plotlist = plots, ncol = length(pathways_of_interest))
+
+```
+
+
+USE THIS
+```{r fig.height = 10}
+# Define the directory containing the Seurat objects
+rds_dir <- "/Users/marvinli/MPNST rds Objects/"
+
+# List all .rds files in the directory
+rds_files <- list.files(path = rds_dir, pattern = "\\.rds$", full.names = TRUE)
+
+# Optionally, create an empty list to store results for each object
+all_results <- list()
+
+# Loop over each RDS file
+for (file in rds_files) {
+  
+  # Load the Seurat object
+  seurat_object <- readRDS(file)
+  
+  ## Differential Expression Analysis and Gene Ranking per Cluster
+  
+  # Get the unique clusters from the Seurat object
+  clusters <- unique(seurat_object$seurat_clusters)
+  
+  # Use lapply to perform DE analysis and compute gene rankings for each cluster
+  gene_ranks <- lapply(clusters, function(cluster) {
+    # Perform DE analysis for the current cluster vs all others
+    markers <- FindMarkers(seurat_object, ident.1 = cluster, ident.2 = NULL, logfc.threshold = 0)
+    
+    # Replace zero p-values with a small value to avoid Inf values
+    markers$p_val[markers$p_val == 0] <- 1e-322
+    markers$p_val_adj[markers$p_val_adj == 0] <- 1e-322
+    
+    # Compute ranking metric: -log10(p_val) * sign(avg_log2FC)
+    markers$rank <- -log10(markers$p_val) * sign(markers$avg_log2FC)
+    
+    # Sort genes by the ranking metric
+    ranked_genes <- markers$rank
+    names(ranked_genes) <- rownames(markers)
+    ranked_genes <- ranked_genes[order(ranked_genes, decreasing = TRUE)]
+    return(ranked_genes)
+  })
+  names(gene_ranks) <- clusters
+  
+  ## fgsea Pathway Enrichment Analysis
+  
+  # Load MSigDB KEGG pathways (you can adjust to other categories if desired)
+  msigdb_data <- msigdbr(species = "Homo sapiens", category = "H")
+  pathways <- split(msigdb_data$gene_symbol, msigdb_data$gs_name)
+  
+  # Run fgsea for all clusters
+  fgsea_results <- lapply(names(gene_ranks), function(cluster) {
+    fgsea(
+      pathways = pathways,
+      stats = gene_ranks[[cluster]],
+      nPermSimple = 50000
+    )
+  })
+  names(fgsea_results) <- names(gene_ranks)
+  
+  # Convert fgsea results into a matrix of NES scores
+  nes_matrix <- do.call(cbind, lapply(fgsea_results, function(result) {
+    result %>% 
+      as.data.frame() %>%
+      select(pathway, NES) %>%
+      arrange(pathway) %>%
+      pull(NES)  # Extract NES column as a vector
+  }))
+  
+  # Set pathway names as row names and cluster names as column names
+  row.names(nes_matrix) <- fgsea_results[[1]]$pathway
+  colnames(nes_matrix) <- names(fgsea_results)
+  
+  ## Extract MPNST Percentage Annotation
+  
+  morphology_percentage <- seurat_object@meta.data %>%
+    count(seurat_clusters, Morphology) %>%  # Count occurrences of each morphology in each cluster
+    pivot_wider(names_from = Morphology, values_from = n, values_fill = 0) %>%  # Convert to wide format
+    mutate(
+      Total = rowSums(across(-seurat_clusters)),  # Compute total spot count per cluster
+      across(-c(seurat_clusters, Total), ~ .x / Total * 100, .names = "{.col}_percentage")  # Compute % for each morphology
+    )
+  
+  # Extract MPNST percentage as a named vector
+  mpnst_percent_vector <- morphology_percentage$MPNST_percentage
+  names(mpnst_percent_vector) <- morphology_percentage$seurat_clusters
+  
+  # Reorder MPNST percentage vector to match nes_matrix column order
+  mpnst_percent_vector <- mpnst_percent_vector[colnames(nes_matrix)]
+  
+  ## Heatmap Visualization
+  
+  # Prepare color gradient for NES values
+  nes_colors <- colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+  
+  # Define the color gradient for MPNST percentage
+  mpnst_percentage_colors <- colorRamp2(c(0, 50, 100), c("white", "lightgreen", "darkgreen"))
+  
+  top_annotation <- HeatmapAnnotation(
+    MPNST = anno_simple(
+      mpnst_percent_vector,
+      col = mpnst_percentage_colors,
+      gp = gpar(col = "grey"),
+      border = TRUE
+    ),
+    annotation_name_side = NULL,  # Prevent annotation names from being shown
+    show_annotation_name = FALSE
+  )
+  
+  # Create custom legends for MPNST percentage and NES values with smaller sizes
+  mpnst_legend <- Legend(
+    title = "MPNST Percentage",
+    col_fun = mpnst_percentage_colors,
+    at = c(0, 50, 100),
+    labels = c("0%", "50%", "100%"),
+    direction = "horizontal",
+    title_gp = gpar(fontsize = 8),
+    labels_gp = gpar(fontsize = 6),
+    grid_height = unit(6, "mm"),
+    grid_width = unit(6, "mm")
+  )
+  
+  nes_legend <- Legend(
+    title = "NES",
+    col_fun = nes_colors,
+    at = c(-2, -1, 0, 1, 2),
+    labels = c("-2", "-1", "0", "1", "2"),
+    direction = "horizontal",
+    title_gp = gpar(fontsize = 8),
+    labels_gp = gpar(fontsize = 6),
+    grid_height = unit(6, "mm"),
+    grid_width = unit(6, "mm")
+  )
+  
+  # Draw the heatmap with the annotation and legends
+  heatmap_plot <- Heatmap(
+    nes_matrix,
+    name = "NES",
+    col = nes_colors,
+    top_annotation = top_annotation,
+    cluster_rows = TRUE,
+    cluster_columns = TRUE, # Change to TRUE to enable hierarchical clustering on columns
+    show_row_names = TRUE,
+    show_column_names = TRUE,
+    rect_gp = gpar(col = "grey"),
+    row_names_gp = gpar(fontsize = 8),
+    column_names_gp = gpar(fontsize = 8),
+    show_heatmap_legend = FALSE
+  )
+  
+  draw(
+    heatmap_plot,
+    annotation_legend_list = list(mpnst_legend, nes_legend),
+    annotation_legend_side = "bottom",
+    heatmap_legend_side = "bottom",
+    merge_legends = TRUE
+  )
+  
+  # Optionally, save the heatmap to a file
+  # pdf(file = paste0(file, "_heatmap.pdf"), height = 18, width = 12)
+  # draw(heatmap_plot, annotation_legend_list = list(mpnst_legend, nes_legend),
+  #      annotation_legend_side = "bottom", heatmap_legend_side = "bottom", merge_legends = TRUE)
+  # dev.off()
+  
+  # Store results for the current object in the all_results list
+  all_results[[basename(file)]] <- list(
+    seurat_object = seurat_object,
+    gene_ranks = gene_ranks,
+    fgsea_results = fgsea_results,
+    nes_matrix = nes_matrix,
+    mpnst_percent_vector = mpnst_percent_vector,
+    heatmap = heatmap_plot
+  )
+}
+
+```
+```{r fig.height=12, fig.width=16}
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+
+# Combine NES matrices from all samples with labels reflecting the sample ID and cluster number:
+combined_nes <- do.call(cbind, lapply(names(all_results), function(file_name) {
+  # Extract the sample's numeric identifier from the file name
+  sample_id <- sub(".*?(\\d+).*", "\\1", file_name)
+  nes <- all_results[[file_name]]$nes_matrix
+  # Rename columns to "<sample_id>_<cluster_number>"
+  colnames(nes) <- paste0(sample_id, "_", colnames(nes))
+  return(nes)
+}))
+
+# Compute the correlation matrix across all clusters
+cor_matrix_all <- cor(combined_nes, use = "pairwise.complete.obs")
+
+# Combine the MPNST percentage vectors from all samples into a single vector
+mpnst_percent_combined <- do.call(c, lapply(names(all_results), function(file_name) {
+  sample_id <- sub(".*?(\\d+).*", "\\1", file_name)
+  mpnst_vector <- all_results[[file_name]]$mpnst_percent_vector
+  # Rename vector elements to match the new column names (i.e., "<sample_id>_<cluster>")
+  names(mpnst_vector) <- paste0(sample_id, "_", names(mpnst_vector))
+  return(mpnst_vector)
+}))
+
+# Ensure the order of MPNST percentages matches the columns of the correlation matrix
+mpnst_percent_combined <- mpnst_percent_combined[colnames(cor_matrix_all)]
+
+# Define a color gradient for MPNST percentage (0% = white, 50% = lightgreen, 100% = darkgreen)
+mpnst_percentage_colors <- colorRamp2(c(0, 50, 100), c("white", "lightgreen", "darkgreen"))
+
+# Create a vector with the sample IDs for each cluster by extracting the part before the underscore
+sample_ids <- sapply(strsplit(colnames(cor_matrix_all), "_"), `[`, 1)
+
+# Get unique sample IDs and assign each a distinct color using RColorBrewer's palette
+unique_samples <- unique(sample_ids)
+sample_color_palette <- brewer.pal(n = length(unique_samples), name = "Set3")
+sample_colors <- setNames(sample_color_palette, unique_samples)
+
+# Create a top annotation that includes both the MPNST percentages and the sample ID annotation.
+top_annotation <- HeatmapAnnotation(
+  MPNST = anno_simple(
+    mpnst_percent_combined,
+    col = mpnst_percentage_colors,
+    gp = gpar(col = "grey"),
+    border = TRUE
+  ),
+  Sample = sample_ids,
+  col = list(Sample = sample_colors),
+  gp = gpar(col = "grey")
+)
+
+# Define a color scale for the correlation values: blue for negative, white for 0, red for positive
+cor_colors <- colorRamp2(c(-1, 0, 1), c("blue", "white", "red"))
+
+# Create and draw the correlation heatmap with the top annotation
+heatmap_plot <- Heatmap(
+  cor_matrix_all,
+  name = "Correlation",
+  col = cor_colors,
+  top_annotation = top_annotation,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_names_gp = gpar(fontsize = 8),
+  column_names_gp = gpar(fontsize = 8),
+  rect_gp = gpar(col = "grey")
+) 
+
+draw(heatmap_plot, heatmap_legend_side = "right", annotation_legend_side = "left")
+
+
+```
+
+```{r}
+all_results <- readRDS("/Users/marvinli/MPNST Spatial Transcriptomics/Pathway enrichment analysis/all_results_fgsea_hallmark.rds")
+```
+
+```{r fig.height=6, fig.width=36}
+# Define pathways of interest
+pathways_of_interest <- c("HALLMARK_TGF_BETA_SIGNALING", "HALLMARK_E2F_TARGETS","HALLMARK_ANDROGEN_RESPONSE", "HALLMARK_HYPOXIA", "HALLMARK_ANGIOGENESIS", "HALLMARK_WNT_BETA_CATENIN_SIGNALING")  # example with multiple pathways
+
+# Set the pt.size factors for the samples
+pt_sizes <- setNames(c(8, 6, 6, 5, 4.5, 6), 
+                     c("mpnst_11502.rds", "mpnst_25729.rds", "mpnst_30175.rds", 
+                       "mpnst_26364.rds", "mpnst_14143.rds", "mpnst_46374.rds"))
+
+# For each pathway, generate a figure with one SpatialFeaturePlot per sample
+pathway_plots <- lapply(pathways_of_interest, function(pathway) {
+  
+  # For each sample, generate a SpatialFeaturePlot for the current pathway
+  sample_plots <- lapply(names(all_results), function(sample_name) {
+    seurat_object <- all_results[[sample_name]]$seurat_object
+    nes_matrix <- all_results[[sample_name]]$nes_matrix
+    
+    # Get pt.size factor for this sample
+    pt_size <- pt_sizes[[sample_name]]
+    
+    # Calculate global NES limits for the current pathway in this sample
+    global_min <- min(nes_matrix[pathway, ], na.rm = TRUE)
+    global_max <- max(nes_matrix[pathway, ], na.rm = TRUE)
+    
+    # Extract NES values for the current pathway
+    nes_values <- nes_matrix[pathway, , drop = FALSE]
+    # Create a named vector mapping clusters to NES values
+    cluster_nes <- setNames(as.numeric(nes_values), colnames(nes_values))
+    # Map NES values to spots based on cluster assignments
+    seurat_object@meta.data[[pathway]] <- cluster_nes[as.character(seurat_object$seurat_clusters)]
+    
+    # Generate the SpatialFeaturePlot with a consistent color scale for this pathway and sample
+    SpatialFeaturePlot(seurat_object, features = pathway, pt.size.factor = pt_size) +
+      scale_fill_gradient2(
+        low = "blue", mid = "white", high = "red", midpoint = 0,
+        limits = c(global_min, global_max)
+      ) +
+      ggtitle(paste(pathway)) +
+      theme(
+        legend.title = element_text(size = 0),
+        legend.text = element_text(size = 8),
+        plot.title = element_text(size = 15, hjust = 0.5)
+      )
+  })
+  
+  # Combine the sample-specific plots for the current pathway into one grid
+  pathway_grid <- cowplot::plot_grid(plotlist = sample_plots, ncol = length(sample_plots))
+  #return(pathway_grid)
+})
+
+# Option 1: Print each pathway-specific figure separately
+lapply(pathway_plots, print)
+
+# Option 2: Combine all pathway figures vertically into one final plot
+#final_plot <- cowplot::plot_grid(plotlist = pathway_plots, ncol = 1)
+#print(final_plot)
+```
+

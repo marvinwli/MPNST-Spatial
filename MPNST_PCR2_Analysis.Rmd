@@ -1,0 +1,113 @@
+---
+title: "MPNST PRC2 Analysis"
+output: html_document
+date: "2025-04-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+ #Load PRC2 mutant samples and combine
+mpnst_26364 <- readRDS("/Users/marvinli/MPNST rds Objects/mpnst_26364.rds")
+mpnst_14143 <- readRDS("/Users/marvinli/MPNST rds Objects/mpnst_14143.rds")
+mpnst_11502 <- readRDS("/Users/marvinli/MPNST rds Objects/mpnst_11502.rds")
+mpnst_25729 <- readRDS("/Users/marvinli/MPNST rds Objects/mpnst_25729.rds")
+```
+
+```{r}
+mpnst_26364$PRC2_status <- "Mutant"
+mpnst_14143$PRC2_status <- "Mutant"
+mpnst_11502$PRC2_status <- "WT"
+mpnst_25729$PRC2_status <- "WT"
+```
+
+```{r}
+combined <- merge(
+  x = mpnst_26364,
+  y = list(mpnst_14143, mpnst_11502, mpnst_25729),
+  add.cell.ids = c("26364","14143","11502","25729")
+)
+# after your merge:
+combined <- PrepSCTFindMarkers(combined, assay = "SCT")
+DefaultAssay(combined) <- "SCT"      # work off the SCT assay
+Idents(combined)    <- combined$PRC2_status
+
+markers_prc2 <- FindMarkers(
+  combined,
+  assay          = "SCT",
+  slot           = "data",       # uses the normalized (log) values
+  ident.1        = "Mutant",
+  ident.2        = "WT",
+  test.use       = "wilcox",
+  logfc.threshold= 0.01,
+  min.pct        = 0.01
+)
+
+```
+
+```{r}
+cells_to_use <- WhichCells(combined, expression = Morphology == "MPNST")
+markers_prc2_in_MPNST <- FindMarkers(
+  combined,
+  cells = cells_to_use,
+  assay          = "SCT",
+  slot           = "data",
+  ident.1        = "Mutant",
+  ident.2        = "WT",
+  test.use       = "wilcox",
+  logfc.threshold= 0,
+  min.pct        = 0
+)
+
+# View top hits
+head(markers_prc2_in_MPNST)
+```
+
+
+pathway enrichment
+
+## GSEA on PRC2-mutant vs WT within MPNST spots
+
+```{r gsea-setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(msigdbr)   # to get Hallmark gene sets
+library(fgsea)     # for fast GSEA
+library(ggplot2)   # for plotting
+
+# 1. Prepare a named vector of statistics (ranked gene list)
+ranked_genes <- markers_prc2_in_MPNST$avg_log2FC
+names(ranked_genes) <- rownames(markers_prc2_in_MPNST)
+# sort descending
+ranked_genes <- sort(ranked_genes, decreasing = TRUE)
+
+# 2. Load Hallmark pathways
+hallmark_sets <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# 3. Run fgsea
+fgsea_res <- fgseaMultilevel(
+  pathways = hallmark_sets,
+  stats    = ranked_genes,
+  minSize  = 15,
+  maxSize  = 500
+)
+
+# 4. Tidy up results
+fgsea_res <- fgsea_res %>%
+  as_tibble() %>%
+  arrange(padj)
+
+# 5. Show top pathways
+fgsea_res %>% 
+  select(pathway, NES, pval, padj, size) %>% 
+  slice_head(n = 10)
+```

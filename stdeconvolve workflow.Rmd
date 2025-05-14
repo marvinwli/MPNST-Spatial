@@ -1,0 +1,499 @@
+---
+title: "STdeconvolve"
+output: html_document
+date: "2025-02-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+# Install remotes package if not installed
+if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+remotes::install_github("JEFworks-Lab/STdeconvolve")
+library(STdeconvolve)
+library(grid)
+library(Seurat)
+library(dplyr)
+library(gridExtra)
+library(ggplot2)
+library(tools)
+library(Matrix)
+```
+
+
+```{r}
+# Define input and output directories
+input_dir <- "/Users/marvinli/MPNST rds Objects/"
+output_dir <- "/Users/marvinli/MPNST Spatial Transcriptomics/STDeconvolve results/mpnst_11502/"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Get list of all .rds files in the input directory
+rds_files <- list.files(input_dir, pattern = "\\.rds$", full.names = TRUE)
+
+# Process each file using lapply instead of a for loop
+lapply(rds_files, function(rds_file) {
+  
+  message("Processing file: ", rds_file)
+  
+  # Load the Seurat object
+  seuratobj <- readRDS(rds_file)
+  
+  # Extract counts and clean them
+  counts_mat <- GetAssayData(seuratobj, assay = "Spatial", slot = "counts")
+  counts_clean <- cleanCounts(counts_mat, min.lib.size = 100)
+  
+  # Select overdispersed genes
+  corpus <- restrictCorpus(counts_clean, plot = TRUE)
+  
+  # Fit LDA model over a range of topics (K=2 to 12)
+  lda_model <- fitLDA(t(as.matrix(corpus)), 
+                      Ks = seq(9, 14, by = 1), 
+                      perc.rare.thresh = 0.05,
+                      plot = TRUE,
+                      ncores = 14,
+                      verbose = TRUE)
+  
+  # Select the optimal model and get topic distributions and gene expression values
+  optLDA <- optimalModel(models = lda_model, opt = "min")
+  results <- getBetaTheta(optLDA,
+                          perc.filt = 0.05,
+                          betaScale = 1000)
+  
+  deconProp <- results$theta
+  
+  # Get spot coordinates and match with deconvolution results
+  pos <- seuratobj@images$slice1$centroids@coords
+  rownames(pos) <- rownames(seuratobj@meta.data)
+  common_spots <- intersect(rownames(deconProp), rownames(pos))
+  pos_subset <- pos[common_spots, ]
+  
+  # Subset annotations (adjust if your annotation variable is different)
+  #annot <- seuratobj$Morphology
+  #annot_subset <- annot[common_spots]
+  
+  # Rotate coordinates (this example rotates by swapping x and y, then negating x)
+  pos_rotated <- pos_subset
+  pos_rotated[, "x"] <- pos_subset[, "y"]
+  pos_rotated[, "y"] <- -pos_subset[, "x"]
+  
+  # Define group colors (adjust as needed)
+  #group_colors <- c("MPNST" = "black", "NF" = "gray", "Muscle" = "lightgray", "Capsule" = "darkgray", "Necrosis" = "lightyellow")
+  
+  # Plot all topics using the rotated coordinates (optional preview)
+  p_rotated <- vizAllTopics(deconProp, pos_rotated, 
+                            #groups = annot_subset, 
+                           #group_cols = group_colors, 
+                            r = 160,
+                            lwd = 0.15)
+  print(p_rotated)
+  
+  # Create individual topic plots
+  ps <- lapply(colnames(deconProp), function(topic) {
+    vizTopic(theta = deconProp, 
+             pos = pos_rotated, 
+             topic = topic, 
+             plotTitle = paste0("X", topic),
+             size = 1.9, 
+             stroke = 0.2, 
+             alpha = 1, 
+             #groups = annot_subset, 
+             #group_cols = group_colors,
+             low = "white",
+             high = "red")
+  })
+  
+  # Create a dynamic layout matrix that adapts to the number of topics
+  n_topics <- length(ps)
+  n_cols <- ceiling(sqrt(n_topics))
+  n_rows <- ceiling(n_topics / n_cols)
+  layout_matrix <- matrix(seq(1, n_topics), nrow = n_rows, ncol = n_cols, byrow = TRUE)
+  
+  arrangedplot <- gridExtra::grid.arrange(grobs = ps, layout_matrix = layout_matrix)
+  
+  # Create a subfolder for the current file using its base name
+  base_name <- file_path_sans_ext(basename(rds_file))
+  output_folder <- file.path(output_dir, base_name)
+  if (!dir.exists(output_folder)) {
+    dir.create(output_folder, recursive = TRUE)
+  }
+  
+  # Save the arranged plot to the subfolder
+  output_file <- file.path(output_folder, "vizTopic.png")
+  ggsave(output_file, arrangedplot, width = 30, height = 20, dpi = 600)
+  message("Saved arranged plot to: ", output_file)
+  
+  # Save the results object as a .rds file in the same subfolder
+  results_file <- file.path(output_folder, "results.rds")
+  saveRDS(results, results_file)
+  message("Saved LDA results object to: ", results_file)
+  
+  invisible(NULL)
+})
+```
+
+
+
+
+
+```{r fig.height=6, fig.width=12}
+# Define directories for Seurat objects and STDeconvolve results
+seurat_dir <- "/Users/marvinli/MPNST rds Objects"
+results_dir <- "/Users/marvinli/MPNST Spatial Transcriptomics/STDeconvolve results"
+
+# Get a list of result subdirectories (each subfolder should be named like the base file, e.g., "mpnst_11502")
+result_subdirs <- list.dirs(results_dir, recursive = FALSE)
+
+# Process each result subdirectory in a vectorized manner
+lapply(result_subdirs, function(subdir) {
+  
+  id <- basename(subdir)
+  results_file <- file.path(subdir, "results.rds")
+  seurat_file <- file.path(seurat_dir, paste0(id, ".rds"))
+  
+  # Check if both required files exist; if not, skip this subdirectory
+  if (!file.exists(results_file) || !file.exists(seurat_file)) {
+    message("Skipping ", id, " because required file(s) are missing.")
+    return(NULL)
+  }
+  
+  message("Processing ", id)
+  
+  # Load the results object and the corresponding Seurat object
+  results <- readRDS(results_file)
+  seuratobj <- readRDS(seurat_file)
+  
+  # Extract the theta matrix (spots x topics)
+  theta <- results$theta
+  
+  # Get the spot annotations (assumed stored in the "Morphology" column)
+  annot <- seuratobj$Morphology
+  
+  # Ensure that spot identifiers match between theta and annotation
+  common_spots <- intersect(rownames(theta), names(annot))
+  theta <- theta[common_spots, , drop = FALSE]
+  annot <- annot[common_spots]
+  
+  # Filter to only include spots labeled as "NF" or "MPNST"
+  keep_idx <- annot %in% c("NF", "MPNST")
+  theta_subset <- theta[keep_idx, , drop = FALSE]
+  annot_subset <- annot[keep_idx]
+  
+  # For each topic, calculate the total weighted contribution (sum of theta values) by group
+  topic_names <- colnames(theta_subset)
+  group_list <- c("NF", "MPNST")
+  
+  # Build a data frame with cumulative weights per topic and group
+  df_list <- lapply(topic_names, function(topic) {
+    sapply(group_list, function(gr) {
+      weight <- sum(theta_subset[annot_subset == gr, topic])
+      data.frame(Topic = topic, Group = gr, Weight = weight)
+    }, simplify = FALSE)
+  }) %>% unlist(recursive = FALSE)
+  
+  df <- do.call(rbind, df_list)
+  
+  # Calculate total cumulative weight per topic and reorder topics accordingly (highest first)
+  total_weight <- df %>%
+    group_by(Topic) %>%
+    summarise(TotalWeight = sum(Weight)) %>%
+    arrange(desc(TotalWeight))
+  df$Topic <- factor(df$Topic, levels = total_weight$Topic)
+  
+  # Create a stacked bar plot where the height reflects the total weight
+  p_total <- ggplot(df, aes(x = Topic, y = Weight, fill = Group)) +
+    geom_bar(stat = "identity") +
+    theme_bw() +
+    labs(title = paste("Stacked Total Weights of NF and MPNST per Topic (", id, ")", sep=""),
+         y = "Total Weight",
+         x = "Topic (ordered by total weight)") +
+    scale_fill_manual(values = c("NF" = "darkorange", "MPNST" = "navyblue"))
+  
+  # Compute proportions per topic for a second plot
+  df_prop <- df %>%
+    group_by(Topic) %>%
+    mutate(Proportion = Weight / sum(Weight)) %>%
+    ungroup()
+  
+  # Create a stacked bar plot where the height reflects the proportion
+  p_prop <- ggplot(df_prop, aes(x = Topic, y = Proportion, fill = Group)) +
+    geom_bar(stat = "identity") +
+    theme_bw() +
+    labs(title = paste("Stacked Proportions of NF and MPNST per Topic (", id, ")", sep=""),
+         y = "Proportion",
+         x = "Topic (ordered by total weight)") +
+    scale_fill_manual(values = c("NF" = "darkorange", "MPNST" = "navyblue"))
+  
+  # Arrange the two plots side by side
+  arranged_plot <- grid.arrange(p_total, p_prop, ncol = 2)
+  
+  # Save the arranged plot to the results subdirectory
+  output_plot_file <- file.path(subdir, paste0(id, "_topic_weights.png"))
+  ggsave(filename = output_plot_file, plot = arranged_plot, width = 12, height = 6, dpi = 300)
+  message("Saved plot to: ", output_plot_file)
+  
+  return(NULL)
+})
+
+```
+
+
+
+
+```{r}
+# Define the directory that contains STDeconvolve results
+results_dir <- "/Users/marvinli/MPNST Spatial Transcriptomics/STDeconvolve results/"
+
+# Get a list of subdirectories, one per sample
+result_subdirs <- list.dirs(results_dir, recursive = FALSE)
+
+# Process each result subdirectory
+lapply(result_subdirs, function(subdir) {
+  
+  id <- basename(subdir)
+  results_file <- file.path(subdir, "results.rds")
+  
+  # Check if the results file exists; skip if missing
+  if (!file.exists(results_file)) {
+    message("Skipping ", id, " because results.rds is missing.")
+    return(NULL)
+  }
+  
+  message("Processing topic genes for: ", id)
+  
+  # Load the results object
+  results <- readRDS(results_file)
+  
+  # Extract the beta matrix (topics x genes)
+  beta <- results$beta
+  
+  # Compute the overall (average) frequency for each gene across topics
+  overall_freq <- colMeans(beta)
+  
+  # Compute the lift metric for each gene in each topic:
+  # lift(t, g) = beta[t, g] / (average beta for gene g)
+  lift_mat <- beta / matrix(rep(overall_freq, each = nrow(beta)), nrow = nrow(beta))
+  
+  # For each topic, sort genes by their lift (in descending order) and select the top 50
+  top_genes_by_topic <- lapply(1:nrow(lift_mat), function(topic_idx) {
+    topic_lift <- lift_mat[topic_idx, ]
+    sorted_genes <- names(sort(topic_lift, decreasing = TRUE))
+    head(sorted_genes, 100)
+  })
+  
+  # Determine the maximum number of genes across topics (should be 50)
+  max_genes <- max(sapply(top_genes_by_topic, length))
+  
+  # Convert the list into a matrix with topics as columns.
+  # Each column corresponds to one topic; missing entries are padded with NA.
+  top_genes_mat <- sapply(top_genes_by_topic, function(genes) {
+    length(genes) <- max_genes
+    genes
+  })
+  colnames(top_genes_mat) <- paste0("Topic_", 1:nrow(beta))
+  
+  # Define the output CSV file path (saved within the same subdirectory)
+  output_csv <- file.path(subdir, paste0(id, "_stdeconvolve_topicgenes.csv"))
+  
+  # Write the matrix to a CSV file without row names
+  write.csv(top_genes_mat, output_csv, row.names = FALSE)
+  message("Saved topic genes CSV to: ", output_csv)
+  
+  invisible(NULL)
+})
+
+```
+SHOWS CORRELEOGRAM OF UNALTERED BETA MATRIX
+```{r fig.height=12, fig.width=14}
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+
+# Define the directory that contains the sample subdirectories with results.rds files
+results_dir <- "/Users/marvinli/MPNST Spatial Transcriptomics/STDeconvolve results/"
+
+# Get a list of subdirectories (one per sample)
+result_subdirs <- list.dirs(results_dir, recursive = FALSE)
+
+# Initialize an empty list to store the beta matrices from each sample
+beta_list <- list()
+
+# Loop over each subdirectory and load the beta matrix from results.rds
+for (subdir in result_subdirs) {
+  sample_id <- basename(subdir)
+  results_file <- file.path(subdir, "results.rds")
+  
+  # Check if the results file exists; skip if it does not
+  if (!file.exists(results_file)) {
+    message("Skipping ", sample_id, " because results.rds is missing.")
+    next
+  }
+  
+  message("Loading results for sample: ", sample_id)
+  results <- readRDS(results_file)
+  
+  # Extract the beta matrix (topics x genes)
+  beta <- results$beta
+  
+  # Ensure row names exist (if not, assign them)
+  if (is.null(rownames(beta))) {
+    rownames(beta) <- paste0("Topic_", seq_len(nrow(beta)))
+  }
+  
+  # Append the sample ID to the topic names for uniqueness
+  rownames(beta) <- paste(sample_id, rownames(beta), sep = "_")
+  
+  # Save the beta matrix to the list
+  beta_list[[sample_id]] <- beta
+}
+
+# Check that we have at least one beta matrix
+if (length(beta_list) == 0) {
+  stop("No valid results.rds files found in the specified directory.")
+}
+
+# Identify the common genes across all samples (if they are not exactly the same)
+common_genes <- Reduce(intersect, lapply(beta_list, colnames))
+
+# Subset each beta matrix to the common set of genes
+beta_list <- lapply(beta_list, function(mat) {
+  mat[, common_genes, drop = FALSE]
+})
+
+# Combine all beta matrices row-wise.
+combined_beta <- do.call(rbind, beta_list)
+
+# Compute the pairwise Spearman correlation between topics.
+# Since rows represent topics and columns represent genes, we transpose the matrix.
+cor_matrix <- cor(t(combined_beta), method = "spearman")
+
+# Save the correlation matrix as a CSV file
+output_csv <- file.path(results_dir, "spearman_correlation_topics.csv")
+write.csv(cor_matrix, output_csv, row.names = TRUE)
+message("Saved Spearman correlation matrix to: ", output_csv)
+
+# ─── Load & prepare -----------------------------------------------------
+# ─── Load libs & compute correlations ───────────────────────────────────
+library(ComplexHeatmap)
+library(circlize)
+library(grid)   # for unit()
+
+# 1) Compute Spearman on your topics×genes matrix
+#    (skip this if you already have cor_matrix)
+# cor_matrix <- cor(t(combined_beta), method = "spearman")
+
+# 2) Pull out the sample ID from names like "mpnst_11502_3"
+sample_ids <- sub("^mpnst_([0-9]+)_.*$", "\\1", rownames(cor_matrix))
+sample_ids <- factor(sample_ids,
+                     levels = c("11502","14143","25729","26364","30175","46374"))
+
+# ─── Define your exact sample palette ───────────────────────────────────
+sample_palette <- c(
+  "11502" = "#A6D854",
+  "14143" = "#66C2A5",
+  "25729" = "#3288BD",
+  "26364" = "#FDAE61",
+  "30175" = "#E6F598",
+  "46374" = "#D53E4F"
+)
+
+# ─── Build annotations ───────────────────────────────────────────────────
+library(purrr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+# 1) Build theta_list, keyed by numeric sample ID
+theta_list <- map(result_subdirs, function(subdir) {
+  folder  <- basename(subdir)                # e.g. "mpnst_11502"
+  sid_num <- sub("^mpnst_", "", folder)      # e.g. "11502"
+  res     <- readRDS(file.path(subdir, "results.rds"))
+  mat     <- res$theta                       # spots × topics
+
+  # ensure we only use spots present in the Seurat object
+  meta_rows <- rownames(samples[[sid_num]]@meta.data)
+  mat       <- mat[intersect(rownames(mat), meta_rows), , drop = FALSE]
+
+  # rename topic columns to "11502_topic1", etc.
+  colnames(mat) <- paste0(sid_num, "_", colnames(mat))
+  mat
+})
+names(theta_list) <- sub("^mpnst_", "", basename(result_subdirs))
+
+# 2) Sum each topic’s theta over MPNST spots
+mpnst_weight_list <- imap(theta_list, function(theta_mat, sid_num) {
+  # Subset metadata to exactly the rows in theta_mat
+  meta_subset <- samples[[sid_num]]@meta.data[rownames(theta_mat), , drop = FALSE]
+  keep        <- meta_subset$Morphology == "MPNST"
+  # Now lengths match exactly, so this works:
+  colSums(theta_mat[keep, , drop = FALSE])
+})
+
+# 3) Flatten and reorder to match cor_matrix
+mpnst_weight_vec <- unlist(mpnst_weight_list)
+
+# Re‐assign the correct names (must exactly match the heatmap rows/columns)
+topic_names <- rownames(cor_matrix)
+mpnst_weight_vec <- mpnst_weight_vec[topic_names]       # reorder
+names(mpnst_weight_vec) <- topic_names                  # set names
+
+# confirm no NAs
+stopifnot(!any(is.na(names(mpnst_weight_vec))))
+
+topic_totals <- rowSums(combined_beta)               # total β per topic
+mpnst_pct    <- 100 * mpnst_weight_vec / topic_totals[topic_names]
+
+ha_col <- HeatmapAnnotation(
+  Sample    = sample_ids,
+  MPNST_pct = anno_barplot(
+    mpnst_pct,
+    gp        = gpar(fill = "#D53E4F"),
+    border    = FALSE,
+    bar_width = 0.8
+  ),
+  col                  = list(Sample = sample_palette),
+  show_annotation_name = FALSE
+)
+
+
+
+# Left (rows) without legend
+ha_row <- rowAnnotation(
+  Sample = sample_ids,
+  col    = list(Sample = sample_palette),
+  show_annotation_name = FALSE,
+  show_legend = FALSE
+)
+
+# ─── Draw the heatmap ───────────────────────────────────────────────────
+Heatmap(
+  cor_matrix,
+  name               = "ρ (Spearman)",
+  col                = colorRamp2(c(-0.6, 0.2, 1), c("blue","white","red")),
+  top_annotation     = ha_col,
+  left_annotation    = ha_row,
+  show_row_names     = TRUE,
+  show_column_names  = TRUE,
+  row_names_side     = "right",   # Show topic names on the right
+  column_names_side  = "bottom",  # Show topic names on the bottom
+  column_names_rot   = 90,        # Rotate for better readability if needed
+  cluster_rows       = T,
+  cluster_columns    = T,
+  row_dend_width     = unit(25, "mm"),
+  column_dend_height = unit(25, "mm"),
+  row_names_gp = gpar(fontsize = 6),
+  column_names_gp = gpar(fontsize = 6),
+  heatmap_legend_param = list(
+    title  = "Correlation",
+    at     = c(-1, 0, 1),
+    labels = c("-1", "0", "1")
+  )
+)
+
+
+```
+
+

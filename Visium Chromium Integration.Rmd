@@ -1,0 +1,443 @@
+---
+title: "Visium/Chromium Integration"
+output: pdf_document
+date: "`r Sys.Date()`"
+---
+
+This workflow intends to integrate snRNAseq data with spatial transcriptomics data using RCTD. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.height = 5, fig.width = 7)
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+```
+
+Load packages, libraries, and spatial data
+```{r, include=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager")
+}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(pheatmap)
+library(Matrix)
+BiocManager::install("SingleR")
+BiocManager::install("celldex")
+library(SingleR)
+library(celldex)
+library(stringr)
+library(spacexr)
+devtools::install_github('immunogenomics/harmony', force = TRUE)
+library(harmony)
+library(viridis)
+library(tidyr)
+library(scales)
+library(tools)
+```
+
+snRNAseq data upload and pre-processing.
+
+# Define the main data directory
+data_dir <- "/Volumes/Safebox/GSE207399_RAW"
+
+# Get sample directories
+sample_dirs <- list.dirs(data_dir, recursive = FALSE, full.names = TRUE)
+sample_names <- sample_names <- basename(sample_dirs)
+
+# Function to create symlinks with correct 10X filenames and read data
+read_custom_10X <- function(dir) {
+  # Find the actual files in the directory
+  barcode_file <- list.files(dir, pattern = "barcodes.tsv.gz$", full.names = TRUE)
+  feature_file <- list.files(dir, pattern = "features.tsv.gz$", full.names = TRUE)
+  matrix_file  <- list.files(dir, pattern = "matrix.mtx.gz$", full.names = TRUE)
+
+  # Check if symlinks already exist to avoid re-creating them
+  if (!file.exists(file.path(dir, "barcodes.tsv.gz"))) {
+    file.symlink(barcode_file, file.path(dir, "barcodes.tsv.gz"))
+  }
+  if (!file.exists(file.path(dir, "features.tsv.gz"))) {
+    file.symlink(feature_file, file.path(dir, "features.tsv.gz"))
+  }
+  if (!file.exists(file.path(dir, "matrix.mtx.gz"))) {
+    file.symlink(matrix_file, file.path(dir, "matrix.mtx.gz"))
+  }
+
+  # Now Read10X() will work correctly
+  Read10X(data.dir = dir, gene.column = 2)
+}
+
+# Create a named list of Seurat objects
+seurat_list <- setNames(lapply(sample_dirs, function(dir) {
+  CreateSeuratObject(counts = read_custom_10X(dir), project = basename(dir), min.cells = 3)
+}), basename(sample_dirs))
+
+```{r}
+# Specify the folder containing the tar.gz files
+folder_path <- "/Users/marvinli/Downloads/GSE179033_RAW/"
+
+# List all .tar.gz files in the folder
+tar_files <- list.files(folder_path, pattern = "\\.tar\\.gz$", full.names = TRUE)
+
+# Extract sample IDs and conditions using regex
+matches <- str_match(basename(tar_files), "GSM54040(\\d+)_([A-Za-z]+)")
+
+# Function to process each file
+process_file <- function(i) {
+  sample_id <- matches[i,2]  # Extract numeric sample ID
+  condition <- matches[i,3]  # Extract NF or MPNST
+
+  # Create a temporary directory for extraction
+  temp_dir <- tempfile(pattern = "untar_")
+  dir.create(temp_dir)
+
+  # Extract the tar.gz file into temp_dir
+  untar(tar_files[i], exdir = temp_dir)
+
+  # Read 10X data from the extracted directory
+  data <- Read10X(data.dir = temp_dir)
+
+  # Create Seurat object
+  seurat_obj <- CreateSeuratObject(counts = data, project = paste0(condition, "_", sample_id))
+
+  # Store metadata
+  seurat_obj$sample_id <- sample_id
+  seurat_obj$condition <- condition
+
+  # Cleanup: Remove extracted files after reading
+  unlink(temp_dir, recursive = TRUE)
+
+  return(seurat_obj)
+}
+
+# Process all files with lapply()
+seurat_list <- setNames(
+  lapply(seq_along(tar_files), process_file),
+  paste0(matches[,3], "_", matches[,2])  # Name list elements as "NF_031", "MPNST_041"
+)
+
+# Remove NULLs if any extractions failed
+seurat_list <- Filter(Negate(is.null), seurat_list)
+
+# Check the loaded objects
+names(seurat_list)
+
+```
+
+Filter and normalize snRNAseq data
+```{r}
+options(future.globals.maxSize = 10 * 1024^3)
+# Define a function to filter and normalize each Seurat object
+process_seurat_object <- function(seurat_obj) {
+  # Filter low-quality nuclei based on gene count, UMI count, and mitochondrial percentage
+  seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")  # Adjust for species if needed
+  
+  seurat_obj <- subset(seurat_obj, subset = 
+                         nFeature_RNA > 200 &  # Keep cells with at least __ detected genes
+                         nFeature_RNA < 9000 &
+                         percent.mt < 20)       # Remove high mitochondrial-content cells
+
+  # Normalize using SCTransform
+  seurat_obj <- SCTransform(seurat_obj, vars.to.regress = c("nCount_RNA", "percent.mt"), verbose = FALSE)
+  
+  return(seurat_obj)
+}
+
+# Apply filtering & normalization to all Seurat objects in the environment
+sn_seurat <- lapply(seurat_list, process_seurat_object)
+```
+
+```{r}
+saveRDS(sn_seurat, file = "/Users/marvinli/MPNST Spatial Transcriptomics/GSE179033_scRNAseq_filtered_SCT.rds")
+```
+
+
+If snRNAseq data was already processed and filtered, upload the RDS using this chunk.
+```{r}
+sn_seurat <- readRDS("/Volumes/SafeBox/MPNST snRNAseq processed seurat/GSE207399_filtered_normalized.rds")
+```
+
+Integration of snRNAseq datasets to create unified reference
+```{r}
+# 1. Subset relevant datasets
+#selected_datasets <- c("M3048", "M803", "M1933", )
+#sn_seurat <- sn_seurat[selected_datasets]
+sn_seurat <- lapply(sn_seurat, RunPCA)
+
+lapply(sn_seurat, function(seurat_obj) ElbowPlot(seurat_obj, ndims = 30))
+
+int_features <- SelectIntegrationFeatures(sn_seurat, nfeatures = 5000)
+sn_seurat <- PrepSCTIntegration(sn_seurat, int_features, assay = "SCT")
+
+# 2. Find integration anchors (adjust dims if needed)
+anchors <- FindIntegrationAnchors(
+  sn_seurat,
+  normalization.method = "SCT",
+  anchor.features = int_features,
+  dims = 1:20  # Use fewer dims (e.g., 1:20) if you see noise in higher PCs
+)
+
+# 3. Integrate datasets
+sn_integrated <- IntegrateData(
+  anchors,
+  normalization.method = "SCT",
+  dims = 1:20
+)
+
+# 4. Continue with PCA/UMAP/clustering
+DefaultAssay(sn_integrated) <- "integrated"
+
+sn_integrated <- RunPCA(sn_integrated, npcs = 50)
+ElbowPlot(sn_integrated, ndims = 50)
+sn_integrated <- RunHarmony(
+  object = sn_integrated,         # Explicitly naming "object" parameter
+  group.by.vars = "orig.ident",   # Batch variable
+  dims = 1:20                     # Correct argument name (dims, not dims.use)
+)
+sn_integrated <- RunUMAP(sn_integrated, dims = 1:20, min.dist = 0.05, spread = 2, reduction = "harmony")
+sn_integrated <- RunTSNE(sn_integrated, dims = 1:20)
+sn_integrated <- FindNeighbors(sn_integrated, dims = 1:20)
+sn_integrated <- FindClusters(sn_integrated, graph.name = "integrated_snn", resolution = 0.8)
+
+DimPlot(sn_integrated, group.by = c("seurat_clusters"), label = T, reduction = "umap")
+```
+
+```{r}
+# Create a data frame of clusters and samples
+metadata <- sn_integrated@meta.data
+orig.ident_contribution_table <- table(metadata$seurat_clusters, metadata$orig.ident)
+
+# Convert to proportions within each cluster
+orig.ident_contribution_proportions <- prop.table(orig.ident_contribution_table, margin = 1)
+
+# Convert the proportions table to a data frame for ggplot
+orig.ident_contribution_df <- as.data.frame(as.table(orig.ident_contribution_proportions))
+colnames(orig.ident_contribution_df) <- c("Cluster", "orig.ident", "Proportion")
+
+# Create a stacked bar plot
+ggplot(orig.ident_contribution_df, aes(x = Cluster, y = Proportion, fill = orig.ident)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Contribution of Each orig.ident to Seurat Clusters",
+       x = "Seurat Cluster", y = "Proportion of Cells") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cluster_orig.ident_df <- sn_integrated@meta.data %>%
+  dplyr::select(seurat_clusters, orig.ident) %>%
+  group_by(seurat_clusters, orig.ident) %>%
+  summarize(count = n()) %>%
+  ungroup()
+
+# Create the bar plot
+ggplot(cluster_orig.ident_df, aes(x = as.factor(seurat_clusters), y = count, fill = orig.ident)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "Cluster", y = "Number of Dots", fill = "orig.ident") +
+  theme_minimal()
+
+```
+
+
+These DEG results to be used to identify canonical marker genes (refer to Vasudevan et al, Suppiah et al)
+```{r}
+# Switch to the "RNA" assay for marker detection (raw counts are preserved here)
+DefaultAssay(sn_integrated) <- "RNA"
+sn_integrated <- NormalizeData(sn_integrated)  # Required for FindMarkers
+sn_integrated <- JoinLayers(sn_integrated)
+sn_integrated <- PrepSCTFindMarkers(sn_integrated)
+# Find markers for all clusters (adjust `logfc.threshold` as needed)
+markers <- FindAllMarkers(
+  sn_integrated,
+  group.by = "seurat_clusters",
+  only.pos = TRUE,
+  min.pct = 0.01,
+  logfc.threshold = 0.2,
+  assay = "SCT",
+  min.diff.pct = 0.1
+)
+
+# View top markers per cluster
+top_markers <- markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 100, order_by = avg_log2FC)
+View(top_markers)
+```
+
+```{r}
+# Define the new cluster identities (make sure the order corresponds to cluster 0 through 16)
+new.cluster.ids <- c(
+  "neural crest-derived, mesenchymal, stem-like tumor cells",  # cluster 0
+  "immature schwann cells",                                     # cluster 1
+  "myelinating schwann cells",                                  # cluster 2
+  "stress-adapted stem-like tumor cells",                       # cluster 3
+  "invasive, mesenchymal-like tumor cells",                     # cluster 4
+  "tumor associated m2 macrophages",                           # cluster 5
+  "myelinating cells",                                          # cluster 6
+  "m1 macrophage",                                              # cluster 7
+  "activated fibroblasts",                                      # cluster 8
+  "proliferating tumor cells",                                  # cluster 9
+  "monocyte-derived antigen-presenting cells",                # cluster 10
+  "activated fibroblasts",                                      # cluster 11
+  "endothelial cells",                                          # cluster 12
+  "stress-adapted stem-like tumor cells",                       # cluster 13
+  "proliferating tumor cells",                                  # cluster 14
+  "T-cells",                                                    # cluster 15
+  "pericytes"                                                   # cluster 16
+)
+
+# Make sure the names of the vector correspond to the current identities
+Idents(sn_integrated) <- sn_integrated$seurat_clusters
+names(new.cluster.ids) <- levels(sn_integrated)
+
+# Update the identities in the Seurat object
+sn_integrated <- RenameIdents(sn_integrated, new.cluster.ids)
+
+# (Optional) Save the new cell type annotations in a metadata column called "cell_type"
+sn_integrated$cell_type <- Idents(sn_integrated)
+
+```
+
+```{r fig.height=6, fig.width=13}
+# --- RCTD Integration and Visualization ---
+
+# 2. Load the Visium spatial data (ensure preprocessed)
+visium_data <- readRDS("/Users/marvinli/MPNST rds Objects/mpnst_46374.rds")
+
+# 3. Prepare the snRNAseq reference for RCTD
+# Ensure your integrated object (sn_integrated) has cell type annotations (e.g., in "cell_type")
+# Here we extract raw counts and metadata from the "RNA" assay
+ref_counts   <- as.matrix(GetAssayData(sn_integrated, assay = "RNA", slot = "counts"))
+ref_meta     <- sn_integrated@meta.data
+ref_cellTypes <- ref_meta$cell_type   # <-- adjust this to your actual cell type label column
+names(ref_cellTypes) <- colnames(sn_integrated)
+
+# Create the reference object (RCTD expects a list with counts, meta, and cell type labels)
+my_reference <- Reference(counts = ref_counts,
+                          cell_types = ref_cellTypes)
+
+# 4. Create the RCTD object using the spatial data and your reference
+# Here, max_cores can be set based on your system resources
+query_counts <- as.matrix(GetAssayData(visium_data, assay = "Spatial", layer = "counts"))
+query_coords <- as.data.frame(visium_data@images$slice1$centroids@coords)
+rownames(query_coords) <- colnames(visium_data)
+puck <- SpatialRNA(query_coords, query_counts)
+
+
+barcodes <- colnames(puck@counts)
+# 5. Run the deconvolution (set doublet_mode as desired; "full" is common)
+myRCTD <- create.RCTD(puck, my_reference, max_cores = 14)
+myRCTD <- run.RCTD(myRCTD, doublet_mode = "multi")
+
+# 6. Extract the results (e.g., cell type weights for each spot)
+rctd_results <- myRCTD@results  # this includes a 'weights' matrix
+cell_type_proportions <- myRCTD@internal_vars$proportions
+
+DimPlot(sn_integrated, group.by = "cell_type", label = T, repel = T, label.size = 4) + theme(legend.text = element_text(size = 8))
+
+
+```
+
+```{r}
+# Output directory for saving images
+output_dir <- "/Users/marvinli/MPNST Spatial Transcriptomics/umaptestplotssnrnaseq"
+dir.create(output_dir, showWarnings = FALSE)  # Create directory if it doesn't exist
+
+clusters <- sort(unique(sn_integrated$seurat_clusters))
+
+# Pre-calculate a fixed color mapping for all cell types in the dataset.
+all_cell_types <- unique(as.character(sn_integrated$cell_type))
+fixed_palette <- hue_pal()(length(all_cell_types))
+names(fixed_palette) <- all_cell_types
+
+# Store UMAP axis limits for consistent scaling across plots
+umap_data <- Embeddings(sn_integrated, reduction = "umap")
+x_limits <- range(umap_data[, 1])
+y_limits <- range(umap_data[, 2])
+
+# Initialize the list of highlighted clusters
+highlighted_clusters <- c()
+
+for (cluster in clusters) {
+  # Add the current cluster (as character) to the cumulative list
+  highlighted_clusters <- c(highlighted_clusters, as.character(cluster))
+  
+  # Create a temporary metadata column "grouping":
+  # For cells in highlighted clusters, use their cell type; for others, assign NA.
+  sn_integrated$grouping <- ifelse(
+    sn_integrated$seurat_clusters %in% highlighted_clusters,
+    as.character(sn_integrated$cell_type),
+    NA
+  )
+  
+  # Generate the UMAP plot using the grouping variable.
+  # Non-highlighted cells (NA) will be colored in gray (via na.value), and no label will appear.
+  p <- DimPlot(sn_integrated, group.by = "grouping", label = TRUE, repel = TRUE, label.size = 5) +
+    scale_color_manual(values = fixed_palette, na.value = "gray80") +
+    theme_classic() +  # Retain axes and background
+    theme(legend.position = "none",
+          plot.title = element_blank()) +
+    xlim(x_limits) + ylim(y_limits)
+  
+  # Save the plot as a transparent PNG (for layering in PowerPoint)
+  ggsave(filename = file.path(output_dir, paste0("cluster_", cluster, ".png")),
+         plot = p, width = 15, height = 10, dpi = 500, bg = "transparent")
+}
+
+message("All cluster UMAP layers saved in: ", output_dir)
+
+```
+
+```{r fig.height=12, fig.width=18}
+# Extract all spot names (barcodes)
+spot_names <- colnames(myRCTD@spatialRNA@counts)
+
+# Extract all cell type names from the first spot (they should be the same for all spots)
+cell_type_names <- names(myRCTD@results[[1]]$all_weights)
+
+# Initialize an empty matrix: (rows = spots, cols = cell types)
+weights_matrix <- matrix(0, nrow = length(spot_names), ncol = length(cell_type_names),
+                         dimnames = list(spot_names, cell_type_names))
+
+# Fill the matrix with all_weights from each spot
+weights_matrix <- do.call(rbind, lapply(myRCTD@results, function(res) res$all_weights))
+
+rownames(weights_matrix) <- spot_names  # Spot barcodes
+colnames(weights_matrix) <- cell_type_names  # Cell types
+
+query_coords <- as.data.frame(myRCTD@spatialRNA@coords)  # Convert coordinates to a data frame
+query_coords$barcode <- rownames(query_coords)  # Ensure rownames are set as a column
+
+weights_df <- as.data.frame(weights_matrix)  # Convert cell type proportions to a data frame
+weights_df$barcode <- rownames(weights_df)  # Ensure rownames are set as a column
+
+# Merge spatial coordinates with deconvolution results
+spatial_df <- merge(query_coords, weights_df, by = "barcode")
+
+spatial_df$max_cell_type <- colnames(weights_matrix)[apply(weights_matrix, 1, which.max)]
+
+long_spatial_df <- spatial_df %>%
+  pivot_longer(cols = colnames(weights_matrix), # Convert all cell type columns
+               names_to = "cell_type",
+               values_to = "proportion")
+
+# Check the structure
+head(long_spatial_df)
+
+
+p <- ggplot(long_spatial_df, aes(x = y, y = -x, fill = proportion)) +
+  geom_point(shape = 21, size = 1.6, stroke = 0.01, color = "white") +
+  scale_fill_viridis_c(option = "plasma") +  # "magma", "inferno", "viridis", "cividis" for different effects
+  coord_fixed() +
+  facet_wrap(~ cell_type, ncol = 5) +  # Creates a separate panel for each cell type
+  labs(title = "Spatial Distribution of Cell Types",
+       x = "X coordinate", y = "Y coordinate", fill = "Proportion") +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 8, face = "bold", color = "white"), 
+        panel.grid.major = element_blank(),  # Remove major grid lines
+        panel.grid.minor = element_blank())  # Adjusts facet labels
+
+ggsave("46374_spatial_distribution.png", plot = p, width = 24, height = 16, dpi = 600)
+
+```
+
+
+

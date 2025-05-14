@@ -1,0 +1,235 @@
+---
+title: "Aggregated MPNST analysis (SCT -> aggregate -> harmony)"
+output: pdf_document
+date: "2024-07-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+Sys.setenv(PATH = paste("/opt/homebrew/bin", Sys.getenv("PATH"), sep = ":"))
+Sys.setenv(LDFLAGS = "-L/opt/homebrew/Cellar/gcc/14.2.0_1/lib/gcc/current")
+Sys.setenv(FC = "/opt/homebrew/bin/gfortran")
+Sys.setenv(F77 = "/opt/homebrew/bin/gfortran")
+Sys.setenv(CXX = "/opt/homebrew/bin/g++")
+Sys.setenv(CC = "/opt/homebrew/bin/gcc")
+```
+
+Load packages, libraries, and spatial data
+```{r, include=FALSE}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(edgeR)
+# Load devtools
+library(devtools)
+devtools::install_github("carter-allen/spruce")
+devtools::install_github("carter-allen/maple")
+library(maple)
+library(spruce)
+devtools::install_github('immunogenomics/harmony', force = TRUE)
+devtools::install_github("zji90/raisin")
+library(raisin)
+library(harmony)
+```
+
+```{r}
+folder_path <- "/Users/marvinli/MPNST rds Objects"
+files <- list.files(folder_path, pattern = "\\.rds$", full.names = TRUE)
+sample_names <- gsub(".*_(\\d+)\\.rds", "\\1", basename(files))
+
+seurat_objects <- setNames(
+  lapply(seq_along(files), function(i) {
+    seurat_obj <- readRDS(files[i])
+    seurat_obj <- RenameCells(seurat_obj, add.cell.id = sample_names[i])
+    seurat_obj$sample <- sample_names[i]  # Add sample information as metadata
+    return(seurat_obj)
+  }),
+  sample_names
+)
+options(future.globals.maxSize = 10 * 1024^3)
+
+seurat_objects <- lapply(seurat_objects, function(obj) {
+  DefaultAssay(obj) <- "Spatial"  # or the appropriate assay
+  SCTransform(obj, assay = "Spatial", new.assay.name = "SCT",
+              return.only.var.genes = FALSE, verbose = FALSE)
+})
+
+
+features <- SelectIntegrationFeatures(object.list = seurat_objects)
+seurat_objects <- PrepSCTIntegration(seurat_objects, features, assay = "SCT")
+
+stanchors <- FindIntegrationAnchors(
+  seurat_objects,
+  normalization.method = "SCT",
+  anchor.features = features,
+  dims = 1:20  # Use fewer dims (e.g., 1:20) if you see noise in higher PCs
+)
+
+all_merged <- IntegrateData(
+  stanchors,
+  normalization.method = "SCT",
+  dims = 1:20
+)
+DefaultAssay(all_merged) <- "integrated"
+all_merged <- RunPCA(all_merged, npcs = 50)
+
+ElbowPlot(all_merged, ndims = 50)
+```
+
+```{r}
+all_merged <- RunHarmony(all_merged, group.by.vars = "sample", dims = 1:30)
+all_merged <- FindNeighbors(all_merged, reduction = "pca", dims = 1:30)
+all_merged <- FindClusters(all_merged, verbose = FALSE)
+all_merged <- RunUMAP(all_merged, reduction = "pca", dims = 1:30)
+
+Idents(all_merged) <- all_merged$seurat_clusters
+p1 <- DimPlot(all_merged, reduction = "umap", label = T) + NoLegend()
+Idents(all_merged) <- all_merged$Morphology
+p2 <- DimPlot(all_merged, reduction = "umap", label = F)
+Idents(all_merged) <- all_merged$sample
+p3 <- DimPlot(all_merged, reduction = "umap", label = F)
+
+p1
+p2
+p3
+```
+
+Calculates the contribution of every sample to the seurat clusters of the aggregated object
+```{r}
+# Create a data frame of clusters and samples
+metadata <- all_merged@meta.data
+sample_contribution_table <- table(metadata$seurat_clusters, metadata$sample)
+
+# Convert to proportions within each cluster
+sample_contribution_proportions <- prop.table(sample_contribution_table, margin = 1)
+
+# Convert the proportions table to a data frame for ggplot
+sample_contribution_df <- as.data.frame(as.table(sample_contribution_proportions))
+colnames(sample_contribution_df) <- c("Cluster", "Sample", "Proportion")
+
+# Create a stacked bar plot
+ggplot(sample_contribution_df, aes(x = Cluster, y = Proportion, fill = Sample)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Contribution of Each Sample to Seurat Clusters",
+       x = "Seurat Cluster", y = "Proportion of Cells") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cluster_sample_df <- all_merged@meta.data %>%
+  dplyr::select(seurat_clusters, sample) %>%
+  group_by(seurat_clusters, sample) %>%
+  summarize(count = n()) %>%
+  ungroup()
+
+# Create the bar plot
+ggplot(cluster_sample_df, aes(x = as.factor(seurat_clusters), y = count, fill = sample)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "Cluster", y = "Number of Dots", fill = "Sample") +
+  theme_minimal()
+
+```
+
+Calculates the contribution of morphology to each seurat cluster of the aggregated object
+```{r}
+morphology_contribution_table <- table(metadata$seurat_clusters, metadata$Morphology)
+morphology_contribution_proportions <- prop.table(morphology_contribution_table, margin = 1)
+morphology_contribution_df <- as.data.frame(as.table(morphology_contribution_proportions))
+colnames(morphology_contribution_df) <- c("Cluster", "Morphology", "Proportion")
+
+ggplot(morphology_contribution_df, aes(x = Cluster, y = Proportion, fill = Morphology)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Contribution of Each Morphology to Seurat Clusters",
+       x = "Seurat Cluster", y = "Proportion of Cells") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Ensure you're using dplyr's select() function
+cluster_morphology_df <- all_merged@meta.data %>%
+  dplyr::select(seurat_clusters, Morphology) %>%
+  group_by(seurat_clusters, Morphology) %>%
+  summarize(count = n()) %>%
+  ungroup()
+
+# Create the bar plot
+ggplot(cluster_morphology_df, aes(x = as.factor(seurat_clusters), y = count, fill = Morphology)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "Cluster", y = "Number of Dots", fill = "Morphology") +
+  theme_minimal()
+```
+
+This code performs raisin fitting and finds the top 30 MPNST DEGs in the aggregated data
+```{r}
+mat <- all_merged$SCT@data
+morph <- all_merged$Morphology
+individual <- sub('_.*','',colnames(mat))
+sample <- paste0(morph,'_',individual)
+barcodes <- colnames(mat)
+
+cellid <- which(morph %in% c('MPNST','NF'))
+design <- data.frame(
+  sample=unique(sample[cellid]),
+  individual=sub('.*_','',unique(sample[cellid])),
+  feature=sub('_.*','',unique(sample[cellid])),
+  stringsAsFactors = F
+)
+
+raisinresults <- (raisintest(raisinfit(mat[,cellid],
+                                 sample[cellid],
+                                 testtype = 'paired',
+                                 design=design)))
+
+```
+
+
+Create spatial feature plots
+```{r fig.height=4, fig.width=15}
+library(ggplot2)
+library(patchwork)
+library(grid)
+library(rlang)
+
+# Define genes of interest
+genes_of_interest <- c("SHH", "DHH", "IHH", "HHIP")
+
+seurat_names <- names(seurat_objects)
+
+pt_sizes <- setNames(c(8, 6, 6, 5, 4.5, 6), c("11502", "25729", "30175", "26364", "14143", "46374"))
+default_pt_size <- 5
+
+# Morphology plots
+morphology_plots <- lapply(seurat_names, function(name) {
+  obj <- seurat_objects[[name]]
+  pt_size <- pt_sizes[[name]] %||% default_pt_size
+  SpatialDimPlot(obj, label = TRUE, label.size = 3, pt.size.factor = pt_size, group.by = "Morphology") +
+    NoLegend() +
+    theme(aspect.ratio = 1, plot.margin = unit(c(0, 0, 0, 0), "cm"))
+})
+morphology_figure <- wrap_plots(morphology_plots, ncol = length(seurat_names)) +
+  plot_layout(widths = rep(1, length(seurat_names)))
+
+# Gene feature plots
+gene_plots <- lapply(genes_of_interest, function(gene) {
+  lapply(seurat_names, function(name) {
+    obj <- seurat_objects[[name]]
+    pt_size <- pt_sizes[[name]] %||% default_pt_size
+    SpatialFeaturePlot(obj, features = gene, pt.size.factor = pt_size) +
+      theme(aspect.ratio = 1, legend.position = "top", plot.margin = unit(c(0, 0, 0, 0), "cm"))
+  })
+})
+gene_figures <- lapply(seq_along(genes_of_interest), function(i) {
+  wrap_plots(gene_plots[[i]], ncol = length(seurat_names)) +
+    plot_layout(widths = rep(1, length(seurat_names)))
+})
+
+# === Write to PDF (just once!) ===
+#pdf("/Users/marvinli/MPNST Spatial Transcriptomics/gene_expression_spatial_plots.pdf", width = 15, height = 5)
+print(morphology_figure)
+print(gene_figures)
+#dev.off()
+```
+
+```{r}
+
+```

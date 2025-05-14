@@ -1,0 +1,459 @@
+---
+title: "Differential Gene Expression and UpSet Plot for MPNST vs NF"
+author: "Your Name"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Load required libraries
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+install.packages("ComplexUpset", repos = "https://cloud.r-project.org/")
+library(ComplexUpset)
+library(tibble)
+install.packages("DT")
+library(DT)
+library(shiny)
+library(tidyr)
+library(purrr)
+install.packages("shinyWidgets")
+library(shinyWidgets)
+```
+
+```{r}
+# Load Seurat objects
+seurat_files <- list.files(path = "/Users/marvinli/MPNST rds Objects/", pattern = "\\.rds$", full.names = TRUE)
+seurat_objects <- lapply(seurat_files, readRDS)
+
+# Extract dataset names
+dataset_names <- gsub(".*_(\\d+)\\.rds", "\\1", basename(seurat_files))
+names(seurat_objects) <- dataset_names
+```
+
+```{r}
+# Precompute DGE results once
+dge_results <- lapply(seurat_objects, function(seurat_obj) {
+  Idents(seurat_obj) <- seurat_obj@meta.data$Morphology  # Ensure morphology column exists
+  FindMarkers(seurat_obj, ident.1 = "MPNST", ident.2 = "NF", 
+              logfc.threshold = 0, 
+              test.use = "wilcox", 
+              min.pct = 0.01) %>%
+    tibble::rownames_to_column("gene")
+})
+names(dge_results) <- dataset_names
+```
+
+```{r}
+# Load your RAISIN results CSV.
+# In this CSV the gene names are stored in column 'X'
+raisin_results <- read.csv("/Users/marvinli/Downloads/raisinresults.csv", stringsAsFactors = FALSE)
+
+ui <- fluidPage(
+  titlePanel("Differentially Expressed Genes - MPNST vs NF"),
+  sidebarLayout(
+    sidebarPanel(
+      width = 2,
+      checkboxGroupInput("selected_groups", "Select Dataset Intersections:", 
+                           choices = dataset_names,  
+                           selected = dataset_names[1:max(2, length(dataset_names))]),
+      
+      # Adjusted P-Value Threshold controls using a -log10 scale.
+      sliderInput("pval_threshold", "Adjusted P-Value Threshold (-log10 scale) (Slider):", 
+                  min = 0, max = 150, value = 2, step = 1),
+      numericInput("pval_threshold_input", "Adjusted P-Value Threshold (-log10 scale) (Type in):", 
+                   value = 2, min = 0, max = 15, step = 0.1),
+      
+      # Log2 Fold-Change Threshold controls.
+      sliderInput("logfc_threshold", "Log2 Fold-Change Threshold (Slider):", 
+                  min = 0, max = 5, value = 0.8, step = 0.01),
+      numericInput("logfc_threshold_input", "Log2 Fold-Change Threshold (Type in):", 
+                   value = 0.8, min = 0, max = 5, step = 0.01),
+      
+      hr(),
+      h4("RAISIN Thresholds"),
+      sliderInput("raisin_fc_threshold", "RAISIN Fold-Change Threshold (Slider):", 
+                  min = 0, max = 5, value = 0, step = 0.01),
+      numericInput("raisin_fc_threshold_input", "RAISIN Fold-Change Threshold (Type in):", 
+                   value = 0, min = 0, max = 5, step = 0.01),
+      sliderInput("raisin_fdr_threshold", "RAISIN FDR Threshold (Slider):", 
+                  min = 0, max = 1, value = 1, step = 0.001),
+      numericInput("raisin_fdr_threshold_input", "RAISIN FDR Threshold (Type in):", 
+                   value = 1, min = 0, max = 1, step = 0.001),
+      
+      h4("Select datasets and adjust thresholds to view shared genes.")
+    ),
+    mainPanel(
+      width = 10,
+      uiOutput("tabs")  # Entire tabsetPanel rendered dynamically
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  
+  # Synchronize slider and numeric inputs.
+  observeEvent(input$pval_threshold, {
+    updateNumericInput(session, "pval_threshold_input", value = input$pval_threshold)
+  })
+  observeEvent(input$pval_threshold_input, {
+    updateSliderInput(session, "pval_threshold", value = input$pval_threshold_input)
+  })
+  
+  observeEvent(input$logfc_threshold, {
+    updateNumericInput(session, "logfc_threshold_input", value = input$logfc_threshold)
+  })
+  observeEvent(input$logfc_threshold_input, {
+    updateSliderInput(session, "logfc_threshold", value = input$logfc_threshold_input)
+  })
+  
+  observeEvent(input$raisin_fc_threshold, {
+    updateNumericInput(session, "raisin_fc_threshold_input", value = input$raisin_fc_threshold)
+  })
+  observeEvent(input$raisin_fc_threshold_input, {
+    updateSliderInput(session, "raisin_fc_threshold", value = input$raisin_fc_threshold_input)
+  })
+  
+  observeEvent(input$raisin_fdr_threshold, {
+    updateNumericInput(session, "raisin_fdr_threshold_input", value = input$raisin_fdr_threshold)
+  })
+  observeEvent(input$raisin_fdr_threshold_input, {
+    updateSliderInput(session, "raisin_fdr_threshold", value = input$raisin_fdr_threshold_input)
+  })
+  
+  # Reactive values to hold filtered DGE data and the upset matrix.
+  reactive_data <- reactiveValues(
+    filtered_dge = lapply(dge_results, function(df) df),
+    upset_data = NULL
+  )
+  
+  # Convert the -log10 p-value threshold to an effective threshold.
+  pval_thresh <- reactive({ 10^(-as.numeric(input$pval_threshold_input)) })
+  logfc_thresh <- reactive({ as.numeric(input$logfc_threshold_input) })
+  
+  # RAISIN thresholds.
+  raisin_fc_thresh <- reactive({ as.numeric(input$raisin_fc_threshold_input) })
+  raisin_fdr_thresh <- reactive({ as.numeric(input$raisin_fdr_threshold_input) })
+  
+  # Update filtering (for the intersection/upset plot) whenever thresholds or dataset selections change.
+  observeEvent(c(input$selected_groups, pval_thresh(), logfc_thresh(),
+                 input$raisin_fc_threshold_input, input$raisin_fdr_threshold_input), {
+    req(input$selected_groups)
+    selected_datasets <- input$selected_groups
+    if (!all(selected_datasets %in% names(dge_results))) {
+      showNotification("Invalid dataset selection. Please try again.", type = "error")
+      return()
+    }
+    
+    # Compute filtered DGE results for the selected datasets.
+    filtered_dge <- lapply(selected_datasets, function(dataset) {
+      dge_results[[dataset]] %>% 
+        filter(p_val_adj < pval_thresh() & abs(avg_log2FC) > logfc_thresh())
+    })
+    names(filtered_dge) <- selected_datasets
+    reactive_data$filtered_dge <- filtered_dge
+    
+    # Extract gene lists from the filtered results.
+    sig_genes_list <- lapply(filtered_dge, function(df) df$gene[!is.na(df$gene)])
+    
+    if (length(selected_datasets) == 1) {
+      genes <- sig_genes_list[[ selected_datasets[1] ]]
+      if (length(genes) == 0) {
+        reactive_data$upset_data <- data.frame()
+        showNotification("No genes meet the criteria. Adjust thresholds.", type = "warning")
+        return()
+      }
+      upset_matrix <- data.frame(rep(1, length(genes)))
+      colnames(upset_matrix) <- selected_datasets
+      rownames(upset_matrix) <- genes
+    } else {
+      # Build the union of genes from all selected datasets.
+      all_genes <- unique(unlist(sig_genes_list))
+      if (length(all_genes) == 0) {
+        reactive_data$upset_data <- data.frame()
+        showNotification("No genes meet the criteria. Adjust thresholds.", type = "warning")
+        return()
+      }
+      
+      log2fc_list <- lapply(selected_datasets, function(dataset) {
+        filtered_dge[[dataset]] %>% select(gene, avg_log2FC) %>% rename(!!dataset := avg_log2FC)
+      })
+      
+      log2fc_matrix <- reduce(log2fc_list, full_join, by = "gene") %>% column_to_rownames("gene")
+      
+      valid_genes <- rownames(log2fc_matrix)[
+        apply(log2fc_matrix, 1, function(x) {
+          values <- x[!is.na(x)]
+          length(values) > 0 && (all(values > 0) || all(values < 0))
+        })
+      ]
+      
+      upset_matrix <- as.data.frame(matrix(0, nrow = length(all_genes), ncol = length(selected_datasets)))
+      colnames(upset_matrix) <- selected_datasets
+      rownames(upset_matrix) <- all_genes
+      
+      for (dataset in selected_datasets) {
+        upset_matrix[rownames(upset_matrix) %in% sig_genes_list[[dataset]], dataset] <- 1
+      }
+      
+      upset_matrix <- upset_matrix[rownames(upset_matrix) %in% valid_genes, ]
+    }
+    
+    # RAISIN filtering: use the gene names from the RAISIN results (stored in column 'X').
+    raisin_filtered_genes <- raisin_results$X[
+      abs(raisin_results$Foldchange) >= raisin_fc_thresh() &
+      raisin_results$FDR <= raisin_fdr_thresh()
+    ]
+    
+    upset_matrix <- upset_matrix[rownames(upset_matrix) %in% raisin_filtered_genes, , drop = FALSE]
+    if (nrow(upset_matrix) == 0) {
+      showNotification("No genes meet the RAISIN thresholds. Adjust thresholds.", type = "warning")
+    }
+    reactive_data$upset_data <- upset_matrix
+  })
+  
+  output$upsetPlot <- renderPlot({
+    if (is.null(reactive_data$upset_data) || nrow(reactive_data$upset_data) == 0) {
+      plot.new()
+      title("No genes meet the criteria.")
+      return()
+    }
+    selected_datasets <- colnames(reactive_data$upset_data)
+    if (length(selected_datasets) < 2) {
+      showNotification("UpSet plot requires at least two datasets. Select more samples.", type = "warning")
+      return(NULL)
+    }
+    ComplexUpset::upset(
+      reactive_data$upset_data,
+      intersect = selected_datasets,
+      min_size = 1,
+      width_ratio = 0.1
+    )
+  })
+  
+  output$selectedGenesTable <- renderDT({
+    req(reactive_data$upset_data, input$selected_groups)
+    selected_cols <- input$selected_groups
+    valid_cols <- colnames(reactive_data$upset_data)
+    selected_cols <- intersect(selected_cols, valid_cols)
+    if (length(selected_cols) == 0) {
+      showNotification("No datasets available after filtering. Adjust thresholds.", type = "error")
+      return(NULL)
+    }
+    # Intersection: genes present in all selected datasets.
+    selected_genes <- rownames(reactive_data$upset_data)[
+      rowSums(reactive_data$upset_data[, selected_cols, drop = FALSE] > 0) == length(selected_cols)
+    ]
+    
+    gene_info_list <- lapply(selected_cols, function(dataset) {
+      reactive_data$filtered_dge[[dataset]] %>%
+        filter(gene %in% selected_genes) %>%
+        select(gene, avg_log2FC, p_val_adj) %>%
+        rename(!!paste0(dataset, "_FC") := avg_log2FC,
+               !!paste0(dataset, "_pval") := p_val_adj)
+    })
+    gene_info_wide <- reduce(gene_info_list, full_join, by = "gene")
+    fc_cols <- grep("_FC$", names(gene_info_wide), value = TRUE)
+    gene_info_wide <- gene_info_wide %>%
+      mutate(Avg_FC = rowMeans(select(., all_of(fc_cols)), na.rm = TRUE)) %>%
+      filter(apply(select(., all_of(fc_cols)), 1, function(x) all(x > 0, na.rm = TRUE) | all(x < 0, na.rm = TRUE)))
+    
+    # Merge in RAISIN results.
+    raisin_info <- data.frame(
+      gene = raisin_results$X,
+      RAISIN_Foldchange = raisin_results$Foldchange,
+      RAISIN_FDR = raisin_results$FDR,
+      stringsAsFactors = FALSE
+    )
+    gene_info_wide <- left_join(gene_info_wide, raisin_info, by = "gene")
+    gene_info_wide <- gene_info_wide %>% 
+      mutate(across(c(fc_cols, "Avg_FC", "RAISIN_Foldchange"), ~ round(.x, 4)))
+    
+    pval_col_candidates <- paste0(selected_cols, "_pval")
+    pval_col_candidates <- pval_col_candidates[pval_col_candidates %in% names(gene_info_wide)]
+    default_order <- if (length(pval_col_candidates) > 0) {
+      col_index <- which(names(gene_info_wide) == pval_col_candidates[1]) - 1  
+      list(list(col_index, "asc"))
+    } else {
+      list()
+    }
+    dt <- datatable(gene_info_wide, options = list(pageLength = 10, order = default_order))
+    dt <- formatSignif(dt, columns = pval_col_candidates, digits = 4)
+    dt
+  })
+  
+  # Download handler for Intersection Genes table.
+  output$download_table <- downloadHandler(
+    filename = function() {
+      paste("differential_expression_table_", Sys.Date(), ".csv", sep = "")
+    },
+    content = function(file) {
+      selected_cols <- input$selected_groups
+      valid_cols <- colnames(reactive_data$upset_data)
+      selected_cols <- intersect(selected_cols, valid_cols)
+      if (length(selected_cols) == 0) {
+        showNotification("No datasets available after filtering. Adjust thresholds.", type = "error")
+        return(NULL)
+      }
+      selected_genes <- rownames(reactive_data$upset_data)[
+        rowSums(reactive_data$upset_data[, selected_cols, drop = FALSE] > 0) == length(selected_cols)
+      ]
+      gene_info_list <- lapply(selected_cols, function(dataset) {
+        reactive_data$filtered_dge[[dataset]] %>%
+          filter(gene %in% selected_genes) %>%
+          select(gene, avg_log2FC, p_val_adj) %>%
+          rename(!!paste0(dataset, "_FC") := avg_log2FC,
+                 !!paste0(dataset, "_pval") := p_val_adj)
+      })
+      gene_info_wide <- reduce(gene_info_list, full_join, by = "gene")
+      fc_cols <- grep("_FC$", names(gene_info_wide), value = TRUE)
+      gene_info_wide <- gene_info_wide %>%
+        mutate(Avg_FC = rowMeans(select(., all_of(fc_cols)), na.rm = TRUE)) %>%
+        filter(apply(select(., all_of(fc_cols)), 1, function(x) all(x > 0, na.rm = TRUE) | all(x < 0, na.rm = TRUE)))
+      
+      raisin_info <- data.frame(
+        gene = raisin_results$X,
+        RAISIN_Foldchange = raisin_results$Foldchange,
+        RAISIN_FDR = raisin_results$FDR,
+        stringsAsFactors = FALSE
+      )
+      gene_info_wide <- left_join(gene_info_wide, raisin_info, by = "gene")
+      gene_info_wide <- gene_info_wide %>% 
+        mutate(across(c(fc_cols, "Avg_FC", "RAISIN_Foldchange"), ~ round(.x, 4))) %>%
+        mutate(across(ends_with("_pval"), ~ sprintf("%.4e", .x)))
+      
+      write.csv(gene_info_wide, file, row.names = FALSE)
+    }
+  )
+  
+  # Download handler for Union Genes table.
+  output$download_union_table <- downloadHandler(
+    filename = function() {
+      paste("union_genes_", Sys.Date(), ".csv", sep = "")
+    },
+    content = function(file) {
+      union_data <- union_gene_data()
+      if (is.null(union_data)) {
+        showNotification("No union genes data available.", type = "error")
+        return(NULL)
+      }
+      write.csv(union_data, file, row.names = FALSE)
+    }
+  )
+  
+  # Union Genes tab: genes that appear in at least m selected datasets.
+  # Updated reactive for Union Genes: genes that are consistently regulated (all up or all down)
+# in at least m of the selected datasets, and that also pass the RAISIN thresholds.
+union_gene_data <- reactive({
+  req(input$selected_groups, input$combo_size)
+  selected <- input$selected_groups
+  m <- as.numeric(input$combo_size)
+  
+  # Create a list to store regulation direction for each gene across selected datasets.
+  gene_directions <- list()
+  for (ds in selected) {
+    # Use the filtered results for the dataset.
+    df <- reactive_data$filtered_dge[[ds]]
+    # Loop over each gene in this dataset.
+    for (i in seq_len(nrow(df))) {
+      gene <- df$gene[i]
+      fc <- df$avg_log2FC[i]
+      # Record the sign (1 for up, -1 for down).
+      gene_directions[[gene]] <- c(gene_directions[[gene]], sign(fc))
+    }
+  }
+  
+  # Determine which genes are consistently regulated in at least m datasets.
+  union_genes <- names(gene_directions)[
+    sapply(gene_directions, function(signs) {
+      (sum(signs > 0) >= m) || (sum(signs < 0) >= m)
+    })
+  ]
+  
+  if (length(union_genes) == 0) {
+    return(NULL)
+  }
+  
+  # Build the union table using the filtered_dge from each dataset.
+  gene_info_list <- lapply(selected, function(ds) {
+    reactive_data$filtered_dge[[ds]] %>%
+      filter(gene %in% union_genes) %>%
+      select(gene, avg_log2FC, p_val_adj) %>%
+      rename(!!paste0(ds, "_FC") := avg_log2FC,
+             !!paste0(ds, "_pval") := p_val_adj)
+  })
+  union_table <- reduce(gene_info_list, full_join, by = "gene")
+  
+  # Optionally, add a column that counts in how many datasets the gene appears.
+  gene_counts <- sapply(union_genes, function(gene) {
+    sum(sapply(selected, function(ds) {
+      df <- reactive_data$filtered_dge[[ds]]
+      if (gene %in% df$gene) 1 else 0
+    }))
+  })
+  union_table$Datasets_Count <- gene_counts[union_table$gene]
+  
+  # Merge in RAISIN information.
+  raisin_info <- data.frame(
+    gene = raisin_results$X,
+    RAISIN_Foldchange = raisin_results$Foldchange,
+    RAISIN_FDR = raisin_results$FDR,
+    stringsAsFactors = FALSE
+  )
+  union_table <- left_join(union_table, raisin_info, by = "gene")
+  
+  # **Absolute RAISIN Threshold Filtering:** Remove genes that do not meet the RAISIN criteria.
+  union_table <- union_table %>%
+    filter(abs(RAISIN_Foldchange) >= raisin_fc_thresh() & RAISIN_FDR <= raisin_fdr_thresh())
+  
+  union_table
+})
+
+  
+  output$unionGenesTable <- renderDT({
+    req(union_gene_data())
+    datatable(union_gene_data(), options = list(pageLength = 10))
+  })
+  
+  # Dynamically render the tabsetPanel.
+  output$tabs <- renderUI({
+    if (length(input$selected_groups) >= 3) {
+      tabsetPanel(
+        tabPanel("Intersection Genes",
+                 plotOutput("upsetPlot"),
+                 h3("Genes in Selected Intersection"),
+                 downloadButton("download_table", "Download Intersection Table"),
+                 DTOutput("selectedGenesTable")
+        ),
+        tabPanel("Union Genes",
+                 h3("Genes Present in at Least N Datasets"),
+                 selectInput("combo_size", "Minimum number of datasets:", 
+                             choices = {
+                               n <- length(input$selected_groups)
+                               if(n > 2) 2:(n-1) else 2
+                             },
+                             selected = 2),
+                 downloadButton("download_union_table", "Download Union Genes Table"),
+                 DTOutput("unionGenesTable")
+        )
+      )
+    } else {
+      tabsetPanel(
+        tabPanel("Intersection Genes",
+                 plotOutput("upsetPlot"),
+                 h3("Genes in Selected Intersection"),
+                 downloadButton("download_table", "Download Intersection Table"),
+                 DTOutput("selectedGenesTable")
+        )
+      )
+    }
+  })
+}
+
+shinyApp(ui, server)
+```
+
+
+

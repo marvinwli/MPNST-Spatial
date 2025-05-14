@@ -1,0 +1,249 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-04-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r fig.height=15, fig.width=20}
+# install.packages("remotes")
+# remotes::install_github("jokergoo/ComplexHeatmap")
+
+library(Seurat)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+
+# -----------------------------------------------------------------------------
+# 1. load your Seurat objects (already SCTransformed), one per sample
+#    adjust names/paths as needed
+# -----------------------------------------------------------------------------
+samples <- list(
+  "11502" = readRDS("/Users/marvinli/MPNST rds Objects/mpnst_11502.rds"),
+  "14143" = readRDS("/Users/marvinli/MPNST rds Objects/mpnst_14143.rds"),
+  "25729" = readRDS("/Users/marvinli/MPNST rds Objects/mpnst_25729.rds"),
+  "26364" = readRDS("/Users/marvinli/MPNST rds Objects/mpnst_26364.rds"),
+  "30175" = readRDS("/Users/marvinli/MPNST rds Objects/mpnst_30175.rds"),
+  "46374" = readRDS("/Users/marvinli/MPNST rds Objects/mpnst_46374.rds")
+)
+
+# 2) aggregate (pseudobulk) per‐cluster expression
+pb_list <- lapply(names(samples), function(sid) {
+  agg <- AggregateExpression(
+    samples[[sid]],
+    assay     = "SCT",
+    slot      = "data",
+    group.by  = "seurat_clusters"
+  )$SCT
+  # make cluster column names unique
+  colnames(agg) <- paste0(sid, "_", colnames(agg))
+  agg
+})
+
+# 3) take the union of all genes
+all_genes <- Reduce(union, lapply(pb_list, rownames))
+
+# 4) pad each matrix so they all share the same row order
+pb_list2 <- lapply(pb_list, function(mat) {
+  missing <- setdiff(all_genes, rownames(mat))
+  if (length(missing)) {
+    filler <- matrix(
+      0,
+      nrow = length(missing),
+      ncol = ncol(mat),
+      dimnames = list(missing, colnames(mat))
+    )
+    mat <- rbind(mat, filler)
+  }
+  # ensure consistent ordering
+  mat[all_genes, , drop = FALSE]
+})
+
+
+# 5) column‐bind into one big pseudobulk matrix
+expr_mat <- do.call(cbind, pb_list2)
+
+# 6) pick top‐N DE genes per cluster across all samples
+topN <- 500
+markers <- lapply(names(samples), function(sid) {
+  m <- FindAllMarkers(
+    samples[[sid]],
+    assay           = "SCT",
+    slot            = "data",
+    group.by        = "seurat_clusters",
+    only.pos        = FALSE,
+    logfc.threshold = 0.01
+  ) %>%
+    mutate(
+      p_val_adj = ifelse(p_val_adj < 1e-300, 1e-300, p_val_adj), # cap tiny p-values
+      ranking_score = -log10(p_val_adj) * sign(avg_log2FC)
+    ) %>%
+    group_by(cluster) %>%
+    slice_max(ranking_score, n = topN) %>%
+    pull(gene)
+})
+
+
+genes_to_use <- unique(unlist(markers))
+expr_sub <- expr_mat[genes_to_use, ]
+
+# ------------------------------------------------------------------------------
+# 6) Convert to numeric matrix & Z-score each gene across clusters
+# ------------------------------------------------------------------------------
+expr_sub_mat <- as.matrix(expr_sub)
+# rows = genes, columns = clusters
+expr_z <- t( scale(t(expr_sub_mat), center = TRUE, scale = TRUE) )
+
+# ------------------------------------------------------------------------------
+# 7) Compute Spearman correlation between cluster signatures
+# ------------------------------------------------------------------------------
+cor_mat <- cor(expr_z, method = "spearman")
+
+
+
+
+
+# New: calculate MPNST percentage for each cluster
+mpnst_percentage_list <- lapply(names(samples), function(sid) {
+  obj <- samples[[sid]]
+  meta <- obj@meta.data
+  meta$full_cluster <- paste0(sid, "_", meta$seurat_clusters)
+  
+  # Calculate percentage MPNST per full cluster
+  meta %>%
+    group_by(full_cluster) %>%
+    summarize(
+      total_spots = n(),
+      mpnst_spots = sum(Morphology == "MPNST"),
+      mpnst_percent = 100 * mpnst_spots / total_spots
+    ) %>%
+    select(full_cluster, mpnst_percent)
+})
+
+# Combine into one big table
+mpnst_percentage_df <- bind_rows(mpnst_percentage_list)
+
+# Create a named vector: names = full_cluster IDs
+mpnst_percent_vec <- setNames(
+  mpnst_percentage_df$mpnst_percent,
+  mpnst_percentage_df$full_cluster
+)
+cluster_names <- colnames(cor_mat)
+# drop the "g" so names match your percent vector
+clean_names <- sub("_g", "_", cluster_names)
+mpnst_percent_vec_matched <- mpnst_percent_vec[clean_names]
+
+
+# ------------------------------------------------------------------------------
+# 8) Build a simple annotation for sample identity
+# ------------------------------------------------------------------------------
+cluster_names_spaced <- paste0("   ", cluster_names)
+sample_ids    <- sub("^([0-9]+)_.*$", "\\1", cluster_names)
+annotation_df <- data.frame(Sample = sample_ids, stringsAsFactors = FALSE)
+library(RColorBrewer)
+# choose one palette with enough distinct colors
+pal <- brewer.pal(max(3, length(unique(sample_ids))), "Set3")
+sample_cols <- setNames(pal[seq_along(unique(sample_ids))],
+                        unique(sample_ids))
+
+ha2 <- HeatmapAnnotation(
+  # 1. Barplot for % MPNST
+  MPNST_percent = anno_barplot(
+    mpnst_percent_vec_matched,
+    gp = gpar(fill = "gray40"),
+    border = FALSE,
+    bar_width = 0.8
+  ),
+
+  # 2. Color bar for sample ID
+  Sample = annotation_df$Sample,
+  col = list(Sample = sample_cols),
+
+  # 3. Text overlay for cluster names
+  Cluster = anno_text(
+    cluster_names_spaced,                      # the text labels
+    rot = 90,                           # rotate 90 degrees (vertical)
+    just = "left",                    # center the text
+    gp = gpar(fontsize = 9)             # font size = 10 is fine
+  ),
+
+  annotation_name_side = "left",
+
+  # 🆕 Key addition: match track heights
+  annotation_height = unit.c(
+    unit(15, "mm"),  # MPNST_percent barplot
+    unit(20, "mm"),  # Sample color bar
+    unit(0, "mm")   # Cluster text
+  )
+)
+
+
+# ------------------------------------------------------------------------------
+# 9) Draw the ComplexHeatmap
+# ------------------------------------------------------------------------------
+Heatmap(
+  cor_mat,
+  name                = "Spearman\nρ",
+  col                 = colorRamp2(c(-1, 0, 1), c("blue", "white", "red")),
+  top_annotation      = ha2,
+  cluster_rows        = TRUE,
+  cluster_columns     = TRUE,
+  show_row_names      = FALSE,
+  show_column_names   = FALSE,
+  show_row_dend       = TRUE,
+  show_column_dend    = TRUE,
+  heatmap_legend_param = list(title_position = "topcenter"),
+  clustering_method_columns = "single",
+  clustering_method_rows = "single"
+)
+```
+
+
+```{r correlation-network-colored, fig.height=30, fig.width=30}
+library(igraph)
+
+# 1) threshold the correlation matrix
+threshold <- 0.4
+adj_mat <- cor_mat
+adj_mat[adj_mat <= threshold] <- 0
+diag(adj_mat) <- 0
+
+# 2) build and simplify
+g <- graph_from_adjacency_matrix(adj_mat,
+                                 mode     = "undirected",
+                                 weighted = TRUE,
+                                 diag     = FALSE) %>%
+     simplify()
+
+# 3) layout with absolute weights
+coords <- layout_with_fr(g, weights = abs(E(g)$weight))
+
+# 4) extract sample for each node
+node_names <- V(g)$name
+node_sample <- sub("^([0-9]+)_.*$", "\\1", node_names)
+
+# 5) reuse your sample_cols palette (must be in scope) or redefine here:
+library(RColorBrewer)
+pal       <- brewer.pal(max(3, length(unique(node_sample))), "Set3")
+sample_cols <- setNames(pal, unique(node_sample))
+
+# 6) assign node colors
+V(g)$color <- sample_cols[node_sample]
+V(g)$size  <- 6
+
+# 7) style edges
+E(g)$width <- abs(E(g)$weight) * 5
+E(g)$color <- ifelse(E(g)$weight > 0, "darkred", "navy")
+
+# 8) plot
+plot(g,
+     layout       = coords,
+     vertex.label = node_names,
+     vertex.color = V(g)$color,
+     vertex.size  = V(g)$size,
+     edge.curved  = 0.2,
+     main         = paste0("Cluster network (ρ > ", threshold, ")"))
+```
