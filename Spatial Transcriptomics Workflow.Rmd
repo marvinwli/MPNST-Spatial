@@ -1,0 +1,459 @@
+---
+title: "STWorkflow"
+output: pdf_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.height = 9, fig.width = 7)
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+```
+
+Load packages, libraries, and spatial data
+```{r, include=FALSE}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(pheatmap)
+library(tidyr)
+library(circlize)
+library(ComplexHeatmap)
+library(dplyr)
+library(gridExtra)
+library(grid)
+library(tidyverse)
+install.packages("magick")
+library(magick)
+```
+
+Load in raw data and perform basic preprocessing and normalization
+```{r fig.height=6, fig.width=8}
+options(future.globals.maxSize = 10 * 1024^3)
+seurat_path <- "/Users/marvinli/OneDrive - Johns Hopkins/MPNST Spatial v2/MPNST_46374/outs/"
+seurat <- Load10X_Spatial(seurat_path)
+seurat <- SCTransform(seurat, assay = "Spatial", verbose = FALSE)
+
+seurat <- RunPCA(seurat, assay = "SCT", verbose = FALSE)
+ElbowPlot(seurat, ndims = 25)
+
+seurat <- FindNeighbors(seurat, reduction = "pca", dims = 1:10)
+seurat <- FindClusters(seurat, verbose = FALSE)
+seurat <- RunUMAP(seurat, reduction = "pca", dims = 1:10)
+
+morphology_groups <- read.csv("/Users/marvinli/MPNST Spatial Transcriptomics/MPNST morphology/46374_Morphology.csv")
+rownames(morphology_groups) <- morphology_groups$Barcode
+seurat <- AddMetaData(seurat, metadata = morphology_groups["Morphology"])
+#saveRDS(seurat, file = "/Users/marvinli/GBM Spatial Transcriptomics/GSE276841_RAW/ST2/50.rds")
+```
+
+
+Load in SCTransformed seurat object with morphology annotations already added
+```{r}
+seurat_path <- "/Users/marvinli/GBM MTAP/GBM rds objects/49.rds"
+seurat <- readRDS(seurat_path)
+plot1 <- VlnPlot(object = seurat, features = "nCount_Spatial", pt.size = 0.1) + NoLegend()
+plot2 <- SpatialFeaturePlot(object = seurat, features = "nCount_Spatial", pt.size.factor = 4) + theme(legend.position = "right")
+
+plot1 + plot2
+SpatialDimPlot(seurat, pt.size.factor = 4, label = T, label.size = 4)
+```
+
+
+```{r}
+Idents(seurat) <- seurat$seurat_clusters
+p1 <- DimPlot(seurat, reduction = "umap", label = TRUE)
+p2 <- SpatialDimPlot(seurat, label = TRUE, label.size = 4, pt.size.factor = 4.5) + NoLegend()
+p3 <- SpatialFeaturePlot(seurat, features = "MTAP", pt.size.factor = 4.5)
+Idents(seurat) <- seurat$Morphology
+p3 <- SpatialDimPlot(seurat, label = TRUE, label.size = 3, pt.size.factor = 6, group.by = "Morphology") + NoLegend()
+p4 <- DimPlot(seurat, reduction = "umap", label = TRUE)
+```
+
+
+```{r}
+p1
+p2
+p3
+p4
+```
+
+
+  
+Differential gene expression analysis
+```{r fig.height=9}
+Idents(seurat) <- seurat$Morphology
+mpnst.nf.markers <- FindMarkers(seurat, ident.1 = "MPNST", ident.2 = "NF")
+top.mpnst.genes <- mpnst.nf.markers[order(mpnst.nf.markers$p_val_adj), ]  # Sort by adjusted p-value
+top.mpnst.genes <- head(top.mpnst.genes, 30)  # Select top 30 genes
+top.mpnst.genes <- (rownames(top.mpnst.genes))
+DoHeatmap(seurat, features = top.mpnst.genes, group.by = "Morphology", size = 3, raster = F) + theme(axis.text.y = element_text(size = 10))
+```
+
+DGEx between clusters
+```{r}
+Idents(seurat) <- seurat$seurat_clusters
+clusterdeg <- FindAllMarkers(seurat)
+```
+Feature expression heatmap (top n features per cluster by adjusted p-val)
+```{r fig.height=9}
+topclustergenes <- top3_markers <- clusterdeg %>%
+  group_by(cluster) %>%
+  top_n(n = 3, wt = -p_val_adj)
+
+DoHeatmap(seurat, features = topclustergenes$gene, group.by = "seurat_clusters", size = 3, raster = F) + theme(axis.text.y = element_text(size = 5))
+```
+
+Downsampled feature expression heatmap (top 20 features by adjusted p-val)
+```{r fig.height=9}
+set.seed(42)  # For reproducibility
+Idents(seurat) <- seurat$seurat_clusters
+sampled_cells <- unlist(lapply(unique(Idents(seurat)), function(cluster) {
+  cells_in_cluster <- WhichCells(seurat, idents = cluster)
+  if (length(cells_in_cluster) > 100) {
+    return(sample(cells_in_cluster, 100))
+  } else {
+    return(cells_in_cluster)
+  }
+}))
+seurat_sampled <- subset(seurat, cells = sampled_cells)
+sampled_cluster_counts <- table(Idents(seurat_sampled))
+print(sampled_cluster_counts)
+#saveRDS(seurat_sampled, file = file.path("/Volumes/SafeBox/MPNST Spatial/Samples 3-8/CB01JHU518_000_analysis/spaceranger/count/seurat/", "seurat_sampled.rds"))
+DoHeatmap(seurat_sampled, features = topclustergenes$gene, group.by = "seurat_clusters", size = 3) + theme(axis.text.y = element_text(size = 5))
+```
+
+Pseudobulk
+```{r fig.height=9}
+avg1 <- AverageExpression(seurat, assays = "SCT", return.seurat = TRUE, group.by = "Morphology", layer = "data")
+DoHeatmap(avg1, features = top.mpnst.genes, group.by = "Morphology", size = 3, raster = F, draw.lines = F) + theme(axis.text.y = element_text(size = 5))
+avg2 <- AverageExpression(seurat, assays = "SCT", return.seurat = TRUE, group.by = "seurat_clusters", layer = "data")
+DoHeatmap(avg2, features = topclustergenes$gene, size = 3, raster = F, draw.lines = F)+ theme(axis.text.y = element_text(size = 5))
+```
+
+Hierarchical clustering
+```{r fig.height=12, fig.width=8}
+top_genes <- unique(topclustergenes$gene)
+valid_genes <- top_genes[top_genes %in% rownames(GetAssayData(avg2, slot = "scale.data"))] 
+
+# Extract data matrix
+data_matrix <- GetAssayData(avg2, slot = "scale.data")[valid_genes, ]
+
+
+# Compute distance matrix and perform hierarchical clustering
+distance_matrix <- dist(t(data_matrix))
+hc <- hclust(distance_matrix)
+
+# Create MPNST gradient annotation
+# Get the counts of MPNST and total spots for each cluster
+mpnst_percentage <- seurat@meta.data %>%
+  group_by(seurat_clusters, Morphology) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = Morphology, values_from = count, values_fill = 0) %>%
+  rowwise() %>%
+  mutate(
+    Total = sum(c_across(everything()[-1])),  # Calculate the total count across all morphologies
+    MPNST_percentage = ifelse(Total > 0, MPNST / Total * 100, 0)  # Avoid division by zero
+  ) %>%
+  ungroup()
+
+# Extract MPNST percentage as a named vector
+mpnst_percent_vector <- mpnst_percentage$MPNST_percentage
+names(mpnst_percent_vector) <- mpnst_percentage$seurat_clusters
+mpnst_percentage_colors <- colorRamp2(c(0, 50, 100), c("white", "lightgreen", "darkgreen"))
+
+top_annotation <- HeatmapAnnotation(
+  MPNST = anno_simple(
+    mpnst_percent_vector,
+    col = mpnst_percentage_colors,
+    gp = gpar(col = "grey"),
+    border = TRUE
+  ),
+  annotation_name_side = NULL,  # This prevents any annotation name from being shown
+  show_annotation_name = FALSE
+)
+mpnst_legend <- Legend(
+  title = "MPNST Percentage",
+  col_fun = mpnst_percentage_colors,
+  at = c(0, 50, 100),
+  labels = c("0%", "50%", "100%"),
+  direction = "horizontal",
+  title_gp = gpar(fontsize = 8),  # Smaller title font
+  labels_gp = gpar(fontsize = 6), # Smaller label font
+  grid_height = unit(6, "mm"),   # Adjust grid height
+  grid_width = unit(6, "mm")     # Adjust grid width
+)
+data_colors <- colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+
+# Draw the heatmap with the annotation and smaller legends
+draw(
+  Heatmap(
+    data_matrix,
+    name = "z-score",
+    col = data_colors,
+    top_annotation = top_annotation,
+    cluster_rows = TRUE,
+    cluster_columns = T, #CHANGE THIS TO TRUE TO SEE HCLUST RESULTS
+    show_row_names = TRUE,
+    show_column_names = TRUE,
+    rect_gp = gpar(col = "grey"),
+    row_names_gp = gpar(fontsize = 10),
+    column_names_gp = gpar(fontsize = 10),
+    show_heatmap_legend = T
+  ),
+  annotation_legend_list = list(mpnst_legend), # Add both legends
+  annotation_legend_side = "bottom",                      # Position legends at the bottom
+  heatmap_legend_side = "right",                         # Position heatmap legend at the bottom
+  merge_legends = F                                    # Merge legends for alignment
+)
+```
+
+clusters of clusters
+```{r fig.height = 5, fig.width = 7)}
+# Function to dynamically update superclusters and reanalyze
+analyze_superclusters <- function(seurat_object, num_superclusters) {
+  
+  # Step 1: Perform hierarchical clustering
+  DefaultAssay(seurat_object) <- "SCT"
+  data_matrix <- GetAssayData(avg2, slot = "scale.data")[valid_genes, ]
+  distance_matrix <- dist(t(data_matrix))
+  hc <- hclust(distance_matrix)
+  plot(hc)
+  rect.hclust(hc, k = num_superclusters)
+  # Cut tree to create superclusters
+  superclusters <- cutree(hc, k = num_superclusters)
+  
+  # Add supercluster labels to metadata
+  seurat_object@meta.data$supercluster <- factor(superclusters[seurat_object@meta.data$seurat_clusters])
+  
+  # Step 2: Find DEGs between superclusters
+  Idents(seurat_object) <- seurat_object$supercluster
+  supercluster_markers <- FindAllMarkers(seurat_object)
+  
+  # Step 3: Calculate morphology contributions to superclusters
+  mpnst_supercluster_percentage <- seurat_object@meta.data %>%
+    group_by(supercluster, Morphology) %>%
+    summarize(count = n(), .groups = "drop") %>%
+    pivot_wider(names_from = Morphology, values_from = count, values_fill = 0) %>%
+    rowwise() %>%
+    mutate(
+      Total = sum(c_across(everything()[-1])),  # Calculate total spots
+      MPNST_percentage = ifelse(Total > 0, MPNST / Total * 100, 0)  # Avoid division by zero
+    ) %>%
+    ungroup()
+  
+  # Step 4: Select Most Significant DEGs (smallest p_val_adj)
+  top_genes_supercluster <- supercluster_markers %>%
+    group_by(cluster) %>%
+    slice_min(order_by = p_val_adj, n = floor(30 / num_superclusters) * 2) %>%  # Get extra genes in case of ties
+    slice_head(n = floor(30 / num_superclusters)) %>%  # Keep only the first `n`
+    pull(gene) %>%
+    unique()
+
+  # Compute log2 fold change matrix for the selected genes
+  log2fc_matrix <- supercluster_markers %>%
+    filter(gene %in% top_genes_supercluster) %>%
+    select(cluster, gene, avg_log2FC) %>%
+    pivot_wider(names_from = cluster, values_from = avg_log2FC, values_fill = 0) %>%
+    column_to_rownames("gene") %>%
+    as.matrix()
+
+  heatmap_data <- log2fc_matrix
+  heatmap_name <- "log2FC"
+  heatmap_colormap <- colorRamp2(c(-4, 0, 4), c("blue", "white", "red"))
+
+  # Step 5: Create heatmap annotations
+  supercluster_percent_vector <- mpnst_supercluster_percentage$MPNST_percentage
+  names(supercluster_percent_vector) <- mpnst_supercluster_percentage$supercluster
+  supercluster_colors <- colorRamp2(c(0, 50, 100), c("white", "lightgreen", "darkgreen"))
+
+  top_annotation_supercluster <- HeatmapAnnotation(
+    MPNST = anno_simple(
+      supercluster_percent_vector,
+      col = supercluster_colors,
+      gp = gpar(col = "grey"),
+      border = TRUE
+    )
+  )
+
+  # Step 6: Draw heatmap with log2FC values
+  heatmap <- draw(
+    Heatmap(
+      heatmap_data,
+      name = heatmap_name,
+      col = heatmap_colormap,
+      top_annotation = top_annotation_supercluster,
+      cluster_rows = TRUE,
+      cluster_columns = TRUE,
+      show_row_names = TRUE,
+      show_column_names = TRUE,
+      rect_gp = gpar(col = "grey"),
+      row_names_gp = gpar(fontsize = 12),
+      column_names_gp = gpar(fontsize = 12),
+      show_heatmap_legend = TRUE
+    ),
+    annotation_legend_side = "bottom",
+    heatmap_legend_side = "right",
+    merge_legends = FALSE
+  )
+  
+  # Step 7: Spatial visualization
+  spatial_plot <- SpatialDimPlot(seurat_object, label = T, label.size = 4, pt.size.factor = 6) + NoLegend()
+  
+  # Step 8: determine which clusters are in which supercluster
+  clusters_in_superclusters <- seurat_object@meta.data %>%
+  group_by(supercluster) %>%
+  summarize(
+    seurat_clusters = paste(unique(as.character(seurat_clusters)), collapse = ", "),# Get unique Seurat clusters for each supercluster
+    .groups = "drop"
+  )
+  
+  # Return results
+    return(list(
+    seurat_object = seurat_object,
+    supercluster_markers = supercluster_markers,
+    heatmap = heatmap,
+    spatial_plot = spatial_plot,
+    mpnst_supercluster_percentage = mpnst_supercluster_percentage,
+    clusters_in_superclusters = clusters_in_superclusters,
+    top_genes_supercluster, top_genes_supercluster
+  ))
+}
+```
+
+Run clusters of clusters
+```{r}
+num_superclusters <- 6  # Change this number to redefine superclusters
+results <- analyze_superclusters(seurat, num_superclusters)
+seurat <- results$seurat_object
+
+
+#Save DEG results
+mpnst_sample_number <- sub(".*MPNST_(\\d+)/outs/?$", "\\1", seurat_path)
+# Define output path
+output_dir <- file.path("/Users/marvinli/MPNST Spatial Transcriptomics", 
+                        paste0(mpnst_sample_number, " supercluster DEG"))
+# Ensure the directory exists
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Construct the output filename
+output_file <- file.path(output_dir, paste0(num_superclusters, " superclusters findallmarkers.csv"))
+# Check if the directory exists; if not, create it
+
+# Write CSV file
+write.csv(results$supercluster_markers, output_file, row.names = T)
+
+
+# Access results
+results$supercluster_markers     # Differential expression results
+results$mpnst_supercluster_percentage  # MPNST morphology percentages
+results$spatial_plot
+results$clusters_in_superclusters
+results$heatmap
+p3
+p2
+SpatialDimPlot(seurat, alpha = 0) + NoLegend()
+```
+
+
+
+```{r spot and cluster morphology, fig.height=12, fig.width=9}
+# Ensure you're using dplyr's select() function
+cluster_morphology_df <- seurat@meta.data %>%
+  dplyr::select(seurat_clusters, Morphology) %>%
+  group_by(seurat_clusters, Morphology) %>%
+  summarize(count = n()) %>%
+  ungroup()
+
+# Create the bar plot
+ggplot(cluster_morphology_df, aes(x = as.factor(seurat_clusters), y = count, fill = Morphology)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "Cluster", y = "Number of Dots", fill = "Morphology") +
+  theme_minimal()
+
+cluster_morphology_df <- seurat@meta.data %>%
+  dplyr::select(seurat_clusters, Morphology) %>%
+  group_by(Morphology, seurat_clusters) %>%
+  summarize(count = n()) %>%
+  ungroup()
+
+# Plot with Morphology on the x-axis and clusters as the fill
+ggplot(cluster_morphology_df, aes(x = Morphology, y = count, fill = as.factor(seurat_clusters))) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "Morphology", y = "Number of Dots", fill = "Cluster") +
+  theme_minimal()
+
+# Calculate proportions for each cluster within each morphology
+cluster_morphology_df <- seurat@meta.data %>%
+  dplyr::select(seurat_clusters, Morphology) %>%
+  group_by(Morphology, seurat_clusters) %>%
+  summarize(count = n()) %>%
+  ungroup() %>%
+  group_by(Morphology) %>%
+  mutate(proportion = count / sum(count) * 100)  # Convert to percentage
+# Create the pie charts without labels for a cleaner look
+pie_chart <- ggplot(cluster_morphology_df, aes(x = "", y = proportion, fill = as.factor(seurat_clusters))) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar(theta = "y") +
+  facet_wrap(~Morphology, ncol = 1) +
+  labs(x = NULL, y = NULL, fill = "Cluster") +
+  theme_minimal() +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank())
+
+# Print pie charts
+print(pie_chart)
+# Reformat data for tables
+percentage_table <- cluster_morphology_df %>%
+  dplyr::select(Morphology, seurat_clusters, proportion) %>%
+  arrange(Morphology, seurat_clusters) %>%
+  mutate(proportion = round(proportion, 2)) %>%
+  rename(Cluster = seurat_clusters, Percentage = proportion)
+
+# Split into separate tables for each morphology, only keeping Cluster and Percentage columns
+mpnst_table <- percentage_table %>% filter(Morphology == "MPNST") %>% select(Cluster, Percentage)
+nf_table <- percentage_table %>% filter(Morphology == "NF") %>% select(Cluster, Percentage)
+muscle_table <- percentage_table %>% filter(Morphology == "Muscle") %>% select(Cluster, Percentage)
+
+# Generate three separate figures for each table
+# MPNST Table
+grid.newpage()
+mpnst_grob <- tableGrob(mpnst_table, rows = NULL)
+grid.draw(mpnst_grob)
+
+# NF Table
+grid.newpage()
+nf_grob <- tableGrob(nf_table, rows = NULL)
+grid.draw(nf_grob)
+
+```
+
+```{r superclusters}
+Idents(seurat) <- seurat$supercluster
+# Define clusters
+clusters_set1 <- c(3)  # Replace with your cluster IDs
+clusters_set2 <- c(4)  # Replace with your cluster IDs
+
+# Subset the Seurat object for selected clusters
+seuratsubset <- subset(seurat, idents = c(clusters_set1, clusters_set2))
+
+# Add a group column
+seuratsubset$group <- ifelse(Idents(seuratsubset) %in% clusters_set1, "Group 1", "Group 2")
+Idents(seuratsubset) <- "group"
+
+# Differential expression analysis
+de_results <- FindMarkers(
+  object = seuratsubset,
+  ident.1 = "Group 1",
+  ident.2 = "Group 2",
+  test.use = "wilcox"
+)
+
+# Order by adjusted p-value ascending
+de_results <- de_results[order(de_results$p_val_adj), ]
+top_n <- 20  # Choose how many top genes you want
+top_de_genes <- de_results[1:top_n, ]
+```
