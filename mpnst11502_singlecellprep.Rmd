@@ -1,0 +1,109 @@
+---
+title: "MPNST Single Cell Workflow"
+output: html_document
+date: "2025-06-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(future.globals.maxSize = 100 * 1024^3)
+```
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(tidyr)
+```
+
+```{r}
+dirpath <- "/projects/yegnalab-hpc/Marvin_Li/CB01JHU525/CB01JHU525_000_analysis/cellranger/FLEX_11502/outs/per_sample_outs/FLEX_11502/count/sample_filtered_feature_bc_matrix/"
+scmat <- Read10X(dirpath)
+scseurat <- CreateSeuratObject(
+  counts = scmat,
+  project = "FLEX_11502",
+  min.cells = 1,
+  min.features = 100
+)
+```
+
+```{r}
+# --- 1. Compute QC metrics ---
+scseurat[["percent.mt"]] <- PercentageFeatureSet(
+  object = scseurat,
+  pattern = "^MT-"
+)
+
+# --- 2. Visualize distributions ---
+VlnPlot(
+  object = scseurat,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+  ncol     = 3
+) + NoLegend()
+
+# Scatter‐plots to see relationships and potential doublets / dead cells
+FeatureScatter(scseurat, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+  ggtitle("Counts vs % Mito")
+FeatureScatter(scseurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  ggtitle("Counts vs Features")
+```
+
+
+Filtering Thresholds: nFeature_RNA < 5000, nCount_RNA < 15000, percent.mt < 4
+```{r}
+# --- 3. Filter cells based on QC thresholds ---
+scseurat_filtered <- subset(
+  x      = scseurat,
+  subset = nFeature_RNA < 5000 & 
+           percent.mt   < 4 &
+           nCount_RNA   < 15000
+)
+```
+
+```{r}
+scseurat_filtered <- SCTransform(scseurat_filtered, verbose = FALSE)
+scseurat_filtered <- RunPCA(scseurat_filtered, verbose = FALSE)
+ElbowPlot(scseurat_filtered, ndims = 30)
+```
+
+```{r}
+scseurat_filtered <- RunUMAP(scseurat_filtered, dims = 1:10, verbose = FALSE)
+scseurat_filtered <- FindNeighbors(scseurat_filtered, dims = 1:10)
+scseurat_filtered <- FindClusters(scseurat_filtered, resolution = 0.5)
+DimPlot(scseurat_filtered, reduction = "umap", label = TRUE)
+```
+
+```{r}
+# 1. Run FindAllMarkers (if you haven't already)
+all.markers <- FindAllMarkers(
+  object         = scseurat_filtered,
+  only.pos       = TRUE,
+)
+
+# 2. For each cluster, keep the top 100 genes by ascending p_val_adj
+top100 <- all.markers %>%
+  group_by(cluster) %>%
+  arrange(p_val_adj) %>%
+  slice_head(n = 100) %>%
+  ungroup()
+
+# 3. Turn into a “wide” table: one column per cluster, rows = ranks 1–100
+top100_wide <- top100 %>%
+  select(cluster, gene) %>%
+  group_by(cluster) %>%
+  mutate(rank = row_number()) %>%
+  ungroup() %>%
+  pivot_wider(
+    names_from  = cluster,
+    values_from = gene
+  ) %>%
+  arrange(rank) %>%
+  select(-rank)   # if you don’t want to keep the rank column
+
+# 4. Write to CSV
+write.csv(
+  top100_wide,
+  file      = "/home/mli110/MPNST-Spatial/sc11502markers.csv",
+  row.names = FALSE,
+  quote     = FALSE
+)
+```
