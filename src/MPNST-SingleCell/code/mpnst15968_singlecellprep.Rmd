@@ -1,0 +1,227 @@
+---
+title: "mpnst 15968 single cell prep"
+output: html_document
+date: "2025-06-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(future.globals.maxSize = 100 * 1024^3)
+```
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+```
+
+```{r}
+dirpath <- "/projects/yegnalab-hpc/Marvin_Li/MPNST/CB01JHU525/CB01JHU525_000_analysis/cellranger/FLEX_15968/outs/per_sample_outs/FLEX_15968/count/sample_filtered_feature_bc_matrix/"
+scmat <- Read10X(dirpath)
+scseurat <- CreateSeuratObject(
+  counts = scmat,
+  project = "FLEX_15968",
+  min.cells = 1,
+  min.features = 100
+)
+```
+
+```{r}
+# --- 1. Compute QC metrics ---
+scseurat[["percent.mt"]] <- PercentageFeatureSet(
+  object = scseurat,
+  pattern = "^MT-"
+)
+
+# --- 2. Visualize distributions ---
+VlnPlot(
+  object = scseurat,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+  ncol     = 3
+) + NoLegend()
+
+# Scatter‐plots to see relationships and potential doublets / dead cells
+FeatureScatter(scseurat, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+  ggtitle("Counts vs % Mito")
+FeatureScatter(scseurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  ggtitle("Counts vs Features")
+```
+
+
+
+Filtering Thresholds: nFeature_RNA < 5000, nCount_RNA < 15000, percent.mt < 4
+```{r}
+# --- 3. Filter cells based on QC thresholds ---
+scseurat_filtered <- subset(
+  x      = scseurat,
+  subset = nFeature_RNA < 5000 & 
+           percent.mt   < 4 &
+           nCount_RNA   < 20000
+)
+```
+
+```{r}
+# 1. Ensure RNA assay is active and normalized
+DefaultAssay(scseurat_filtered) <- "RNA"
+scseurat_filtered <- NormalizeData(scseurat_filtered, assay = "RNA", verbose = FALSE)
+
+# 2. Cell-cycle scoring
+s.genes   <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+scseurat_filtered <- CellCycleScoring(
+  scseurat_filtered,
+  s.features   = s.genes,
+  g2m.features = g2m.genes,
+  set.ident    = FALSE
+)
+# 3. SCTransform regressing out cell-cycle
+scseurat_filtered <- SCTransform(
+  scseurat_filtered,
+  assay          = "RNA",
+  vars.to.regress= c("S.Score","G2M.Score"),
+  verbose        = FALSE
+)
+# 4. PCA and ElbowPlot
+scseurat_filtered <- RunPCA(scseurat_filtered, verbose = FALSE)
+ElbowPlot(scseurat_filtered, ndims = 30)
+
+```
+
+
+```{r}
+scseurat_filtered <- RunUMAP(scseurat_filtered, dims = 1:13, verbose = FALSE)
+scseurat_filtered <- FindNeighbors(scseurat_filtered, dims = 1:13)
+scseurat_filtered <- FindClusters(scseurat_filtered, resolution = .25)
+DimPlot(scseurat_filtered, reduction = "umap", label = TRUE)
+```
+
+```{r}
+# 1. Run FindAllMarkers (if you haven't already)
+all.markers <- FindAllMarkers(
+  object         = scseurat_filtered,
+  only.pos       = TRUE,
+)
+
+# 2. For each cluster, keep the top 100 genes by ascending p_val_adj
+top100 <- all.markers %>%
+  group_by(cluster) %>%
+  arrange(p_val_adj) %>%
+  slice_head(n = 200) %>%
+  ungroup()
+
+# 3. Turn into a “wide” table: one column per cluster, rows = ranks 1–100
+top100_wide <- top100 %>%
+  select(cluster, gene) %>%
+  group_by(cluster) %>%
+  mutate(rank = row_number()) %>%
+  ungroup() %>%
+  pivot_wider(
+    names_from  = cluster,
+    values_from = gene
+  ) %>%
+  arrange(rank) %>%
+  select(-rank)   # if you don’t want to keep the rank column
+
+# 4. Write to CSV
+write.csv(
+  top100_wide,
+  file      = "/home/mli110/MPNST-Spatial/sc15968markers.csv",
+  row.names = FALSE,
+  quote     = FALSE
+)
+```
+
+```{r}
+DimPlot(scseurat_filtered, reduction = "umap", label = TRUE, shuffle = T)
+#VlnPlot(scseurat_filtered, features = c("CD8A", "GZMK", "CD3D", "NKG7", "NCAM1", "TYROBP", "FCGR3A", "CD4", "CLEC10A", "CLEC9A", #"CD74", "CD163"),
+#    pt.size = 0.2, ncol = 4)
+
+```
+
+```{r}
+cluster_annotations <- c(
+  "0" = "Stroma (CAF)",
+  "1" = "Proliferating cells",
+  "2" = "Stroma (CAF)",
+  "3" = "Skeletal muscle",
+  "4" = "Macrophages (TAM)",
+  "5" = "Stroma (CAF)",
+  "6" = "Endothelial",
+  "7" = "Dendritic cells",
+  "8" = "CD8 (activated)",
+  "9" = "Neutrophils",
+  "10" = "Pericyte/Vascular SM"
+)
+
+scseurat_filtered@meta.data$celltype <- cluster_annotations[ as.character(scseurat_filtered@meta.data$seurat_clusters) ]
+DimPlot(scseurat_filtered, group.by = "celltype", label = T, label.size = 3, repel = T)
+```
+
+```{r fig.width=30}
+# ─────────────────────────────────────────────────────────────────────────────
+cluster_markers <- list(
+  "Cluster_0: CAF / Reactive Stroma"        = c("DCN",    "LUM",    "PDGFRA"),
+  "Cluster_1: Proliferative Cells"          = c("MKI67",  "TOP2A",  "CDK1"),
+  "Cluster_2: Stromal Fibroblasts (CAF)"    = c("EMILIN3","SPARC",  "FN1"),
+  "Cluster_3: Skeletal Muscle–like"         = c("MYOG",   "NEB",    "TNNT3"),
+  "Cluster_4: Macrophages / TAMs"           = c("CD163",  "C1QA",   "CSF1R"),
+  "Cluster_5: ECM-Remodeling CAFs"          = c("COMP",   "SFRP4",  "THBS2"),
+  "Cluster_6: Endothelial Cells"            = c("VWF",    "PECAM1", "CDH5"),
+  "Cluster_7: cDC2 Dendritic Cells"         = c("CD1C",   "CLEC10A","FLT3"),
+  "Cluster_8: CD8⁺ T Cells"                 = c("CD8A",   "GZMA",   "PRF1"),
+  "Cluster_9: Neutrophils"                  = c("S100A8", "S100A9", "CXCR2"),
+  "Cluster_10: Pericytes / Vascular SMCs"   = c("PDGFRB", "ACTA2",  "RGS5")
+)
+# ─────────────────────────────────────────────────────────────────────────────
+
+pdf("/projects/yegnalab-hpc/Marvin_Li/MPNST/singlecell_figures/15968_Celltype_FeaturePlots.pdf", width = 20, height = 6)
+
+for (cluster_name in names(cluster_markers)) {
+  # A) UMAP DimPlot of clusters on the left
+  p_umap <- DimPlot(
+    object    = scseurat_filtered,
+    reduction = "umap",
+    group.by  = "seurat_clusters",
+    label     = T,
+    label.size = 4
+  ) +
+    NoLegend() +
+    ggtitle("Celltype") +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  # B) FeaturePlots for this cluster’s markers
+  feature_list <- FeaturePlot(
+    object    = scseurat_filtered,
+    features  = cluster_markers[[cluster_name]],
+    reduction = "umap",
+    combine   = FALSE,
+    pt.size   = 0.4,
+    order     = TRUE
+  )
+  
+  # C) Combine into one row with equal widths
+  all_panels <- c(list(p_umap), feature_list)
+  combined <- wrap_plots(
+    all_panels,
+    ncol   = length(all_panels),
+    widths = rep(1, length(all_panels))
+  ) +
+    plot_annotation(title = cluster_name) &
+    theme(
+      
+      plot.title     = element_text(size = 16, face = "bold")
+    )
+  
+  # D) Print this as one page
+  print(combined)
+}
+
+# Close the PDF device
+dev.off()
+```
+
+```{r}
+saveRDS(scseurat_filtered, file = "/projects/yegnalab-hpc/Marvin_Li/MPNST/MPNST singlecell rds objects/filtered_15968.RDS")
+```
